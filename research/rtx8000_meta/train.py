@@ -790,6 +790,9 @@ class DistMuonAdamW(torch.optim.Optimizer):
             grad = p.grad
             if grad is None:
                 continue
+            if world_size == 1:
+                infos[p] = dict(future=None, grad_slice=grad, is_small=True)
+                continue
             if p.numel() < 1024 or grad.shape[0] % world_size != 0:
                 future = dist.all_reduce(grad, op=dist.ReduceOp.AVG, async_op=True).get_future()
                 infos[p] = dict(future=future, grad_slice=grad, is_small=True)
@@ -819,8 +822,11 @@ class DistMuonAdamW(torch.optim.Optimizer):
                 active_mask[i].fill_(True)
         if len(params) < padded:
             stacked_grads[len(params):].zero_()
-        grad_chunk = torch.empty(chunk_size, *shape, dtype=dtype, device=device)
-        future = dist.reduce_scatter_tensor(grad_chunk, stacked_grads, op=dist.ReduceOp.AVG, async_op=True).get_future()
+        if world_size == 1:
+            grad_chunk, future = stacked_grads, None
+        else:
+            grad_chunk = torch.empty(chunk_size, *shape, dtype=dtype, device=device)
+            future = dist.reduce_scatter_tensor(grad_chunk, stacked_grads, op=dist.ReduceOp.AVG, async_op=True).get_future()
         return dict(
             future=future,
             grad_chunk=grad_chunk,
@@ -831,7 +837,8 @@ class DistMuonAdamW(torch.optim.Optimizer):
 
     def _compute_adamw(self, group, info, gather_list, rank, world_size):
         for p, pinfo in info['param_infos'].items():
-            pinfo['future'].wait()
+            if pinfo['future'] is not None:
+                pinfo['future'].wait()
             state = self.state[p]
             if pinfo['is_small']:
                 p_slice = p
@@ -857,7 +864,8 @@ class DistMuonAdamW(torch.optim.Optimizer):
                 gather_list.append(dict(future=future, params=None))
 
     def _compute_muon(self, group, info, gather_list, rank):
-        info['future'].wait()
+        if info['future'] is not None:
+            info['future'].wait()
         params = group['params']
         chunk_size = info['chunk_size']
         p = params[0]
@@ -886,13 +894,16 @@ class DistMuonAdamW(torch.optim.Optimizer):
             updated[:num_owned].copy_(owned)
         if num_owned < chunk_size:
             updated[num_owned:].zero_()
+        if info['future'] is None:
+            torch._foreach_copy_(params, list(updated[:len(params)].unbind(0)))
+            return
         stacked_params = info["stacked_grads"]
         future = dist.all_gather_into_tensor(stacked_params, updated, async_op=True).get_future()
         gather_list.append(dict(future=future, stacked_params=stacked_params, params=params))
 
     @torch.no_grad()
     def step(self):
-        rank, world_size = dist.get_rank(), dist.get_world_size()
+        rank, world_size = (dist.get_rank(), dist.get_world_size()) if dist.is_initialized() else (0, 1)
         reduce_infos = []
         for group in self.param_groups:
             if group['kind'] == 'adamw': reduce_infos.append(self._reduce_adamw(group, world_size))
