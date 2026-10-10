@@ -2,6 +2,7 @@ import unittest
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 from virtual_rank import collect_virtual_gradients, select_trial_parameters, _temporary_step
 
@@ -130,6 +131,31 @@ class VirtualRankTests(unittest.TestCase):
             with self.assertRaises(FloatingPointError):
                 _temporary_step([p], 0.5)
             torch.testing.assert_close(p, torch.ones_like(p), rtol=0, atol=0)
+
+    def test_fp16_large_vocabulary_retains_non_target_gradients(self):
+        # A token contribution to a 2048-token mean with 256 accumulated
+        # microbatches. Pre-dividing the loss erased every non-target gradient.
+        old_threads = torch.get_num_threads()
+        torch.set_num_threads(2)
+        try:
+            model = nn.Module()
+            model.register_parameter('logits', nn.Parameter(torch.zeros(1, 50257)))
+            target = torch.tensor([0])
+            x = torch.zeros(1, dtype=torch.long)
+            reference_loss = F.cross_entropy(model.logits, target) / 2048
+            expected, = torch.autograd.grad(reference_loss, model.logits)
+            def fp16_forward(batch_x, batch_y):
+                return F.cross_entropy(model.logits.half().float(), batch_y) / 2048
+            collect_virtual_gradients(
+                model, [model.logits], [], x, target, lambda: (x, target, 1),
+                fp16_forward, FixedScaler(128.0), virtual_ranks=8,
+                microsteps_per_half=16, step_norm=0.5,
+            )
+            actual = model.logits.grad / 128.0
+            self.assertTrue(bool((actual[0, 1:] > 0).all()))
+            torch.testing.assert_close(actual, expected, rtol=0.01, atol=0)
+        finally:
+            torch.set_num_threads(old_threads)
 
     def test_matrix_selection(self):
         weights = {

@@ -61,7 +61,9 @@ def collect_virtual_gradients(
     Each virtual rank gets ``microsteps_per_half`` batches for A and the same
     number for B. ``forward_loss`` must return a scalar mean loss. GradScaler's
     common scale cancels when the A gradient is normalized; gradients are
-    unscaled by the caller before the real optimizer step.
+    unscaled by the caller before the real optimizer step. Normalize the
+    accumulated parameter gradients after backward, in FP32: dividing each
+    loss first can underflow non-target softmax gradients in FP16.
     """
     if virtual_ranks < 1 or microsteps_per_half < 1:
         raise ValueError("Each virtual rank needs at least one A and one B microbatch")
@@ -80,7 +82,7 @@ def collect_virtual_gradients(
                 for _ in range(microsteps_per_half):
                     loss = forward_loss(x, y)
                     train_loss = train_loss + loss.detach() / total_microsteps
-                    scaler.scale(loss / total_microsteps).backward()
+                    scaler.scale(loss).backward()
                     x, y, epoch = next_batch()
                 if half == 0 and trial_params:
                     original_weights = _temporary_step(trial_params, step_norm)
@@ -98,5 +100,5 @@ def collect_virtual_gradients(
 
     model.zero_grad(set_to_none=True)
     for p, grad in zip(trainable_params, accumulated_grads):
-        p.grad = grad
+        p.grad = grad.div_(total_microsteps) if grad is not None else None
     return train_loss, x, y, epoch

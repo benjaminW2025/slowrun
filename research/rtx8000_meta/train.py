@@ -1437,7 +1437,7 @@ while current_epoch <= args.num_epochs:
     steps_done = step - 3
     eta_str = f" | eta: {(target_iterations - step) * total_training_time / steps_done / 60:.1f}m" if steps_done > 0 else ""
     train_backprop_iterations = min(TRAIN_BACKPROP_ITERATIONS, active_num_iterations)
-    print0(f"step {step:05d} ({pct:.2f}%) | loss: {debiased:.6f} | dt: {dt*1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f}% | iters: {active_num_iterations}{eta_str}")
+    print0(f"step {step:05d} ({pct:.2f}%) | loss: {debiased:.6f} | raw_loss: {train_loss_f:.6f} | dt: {dt*1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f}% | iters: {active_num_iterations}{eta_str}")
     wandb_run.log({
         "step": step,
         "train/loss": debiased,
