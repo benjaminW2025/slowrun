@@ -1,5 +1,13 @@
 import ast
 import copy
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
+from contextlib import nullcontext
+from types import SimpleNamespace
 from pathlib import Path
 import unittest
 
@@ -129,6 +137,88 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertAlmostEqual(trial['b_loss_change'], -.35, places=5)
         self.assertAlmostEqual(trial['first_order_b_loss_change'], -.36, places=5)
         self.assertAlmostEqual(trial['nonlinear_residual'], .01, places=5)
+        self.assertAlmostEqual(trial['cosine_a_b_prime'], 1, places=5)
+        self.assertAlmostEqual(trial['relative_b_gradient_change'], .2 / 3.6, places=5)
+        self.assertAlmostEqual(trial['cosine_a_b_correction'], -1, places=5)
+        self.assertAlmostEqual(trial['cosine_b_b_prime'], 1, places=5)
+        self.assertAlmostEqual(trial['b_prime_norm'], 3.4, places=5)
+        self.assertAlmostEqual(trial['b_prime_norm_ratio'], 3.4 / 3.6, places=5)
+
+    def test_alignment_only_restores_state_and_handles_zero_gradient(self):
+        muon_ids = {id(p) for g in self.optimizer.param_groups if g['kind'] == 'muon' for p in g['params']}
+        selected = select_trial_parameters(self.model.named_parameters(), muon_ids, 'qk')
+        # Zero attention output projection blocks QK gradients at both theta and theta'.
+        with torch.no_grad():
+            for block in self.model.transformer.h: block.attn.c_proj.weight.zero_()
+        before = self.snapshot()
+        records = probe_episode(self.model, self.optimizer, self.model.named_parameters(),
+                                *self.capture, self.forward, None, 128,
+                                modes=('qk',), radii=(.1,), alignment_only=True)
+        self.check_snapshot(before)
+        m, t = records[0], records[0]['trials'][0]
+        self.assertIsNone(m['cosine_a_b'])
+        self.assertEqual(t['step_norm'], 0)
+        self.assertEqual(t['b_loss_change'], 0)
+        self.assertIsNone(t['cosine_b_b_prime'])
+        self.assertIsNone(t['relative_b_gradient_change'])
+        self.assertEqual(t['b_correction_norm'], 0)
+
+    def test_actual_profile_only_block_writes_all_groups_without_update(self):
+        tree = ast.parse(Path(__file__).with_name('train.py').read_text())
+        loop = next(n for n in tree.body if isinstance(n, ast.While))
+        gate = next(n for n in loop.body if isinstance(n, ast.If) and ast.unparse(n.test) == 'capture_episodes is not None')
+        self.model.zero_grad(set_to_none=True)
+        before = self.snapshot()
+        with tempfile.TemporaryDirectory() as run_dir:
+            ns = dict(torch=torch, probe_episode=probe_episode, orig_model=self.model,
+                      optimizer=self.optimizer, capture_episodes=[self.capture],
+                      probe_modes=('qk', 'v', 'mlp'), probe_radii=(.1, .5),
+                      step=2, current_epoch=1, active_num_iterations=2, TRAIN_BACKPROP_ITERATIONS=1,
+                      muon_step_fused=self.ns['muon_step_fused'], autocast_ctx=nullcontext(),
+                      scaler=SimpleNamespace(get_scale=lambda: 128), MATRIX_LR=.032, lrm=1., wd=.8,
+                      synchronize=lambda: None, print0=lambda *a, **k: None,
+                      args=SimpleNamespace(probe_pairs=1, probe_pair_offset=0, probe_alignment_only=True, probe_only=True,
+                                           mg_mode='off', precision='fp32', init_model='checkpoint.pt'),
+                      time=time, os=os, json=json, sys=sys, master_process=True, run_dir=run_dir,
+                      dist=SimpleNamespace(is_initialized=lambda: False),
+                      wandb_run=SimpleNamespace(finish=lambda: None))
+            with self.assertRaises(SystemExit) as exit:
+                exec(compile(ast.Module([gate], type_ignores=[]), 'profile_only_block', 'exec'), ns)
+            self.assertEqual(exit.exception.code, 0)
+            self.check_snapshot(before)
+            path = Path(run_dir) / 'probes.jsonl'
+            record = json.loads(path.read_text())
+            self.assertEqual([m['mode'] for m in record['measurements']], ['qk', 'v', 'mlp'])
+            self.assertEqual(record['episodes'][0]['sequences_a'], 1)
+            summary = subprocess.check_output([sys.executable, str(Path(__file__).with_name('summarize_probes.py')),
+                                               str(path), '--alignment', '--aggregate'], text=True)
+            self.assertIn('cos(B,Bprime)', summary)
+            self.assertIn('B-hurt=', summary)
+
+    def test_standalone_pair_offset_selects_new_batches_without_backward(self):
+        tree = ast.parse(Path(__file__).with_name('train.py').read_text())
+        loop = next(n for n in tree.body if isinstance(n, ast.While))
+        gate = next(n for n in loop.body if isinstance(n, ast.If) and ast.unparse(n.test) == 'args.probe_only and args.probe_alignment_only')
+        captures = [([], []), ([], [])]
+        batches = [(torch.tensor([[i]]), torch.tensor([[i + 1]]), 1) for i in range(12)]
+        ns = dict(args=SimpleNamespace(probe_only=True, probe_alignment_only=True, probe_pair_offset=3),
+                  torch=torch, microsteps_per_half=1, capture_episodes=captures,
+                  x=batches[0][0], y=batches[0][1], train_loader=iter(batches[1:]))
+        exec(compile(ast.Module([gate], type_ignores=[]), 'pair_offset_capture', 'exec'), ns)
+        actual = [[int(half[0][0].item()) for half in episode] for episode in captures]
+        self.assertEqual(actual, [[6, 7], [8, 9]])
+        self.assertEqual(ns['x'].item(), 10)
+
+    def test_multiple_episode_capture_matches_actual_batches(self):
+        captures = [([], []), ([], [])]
+        iterator = iter(self.batches[1:] + [self.batches[0]])
+        collect_virtual_gradients(self.model, self.params, [], *self.batches[0],
+                                  lambda: (*next(iterator), 1), self.forward, FixedScaler(128),
+                                  2, 1, .5, capture_episodes=captures)
+        for episode, originals in zip(captures, (self.batches[:2], self.batches[2:])):
+            for half, original in zip(episode, originals):
+                self.assertEqual(len(half), 1)
+                for a, b in zip(half[0], original): torch.testing.assert_close(a, b, rtol=0, atol=0)
 
     def test_capture_does_not_change_training_or_consume_extra_batches(self):
         self.assertEqual(len(self.capture[0]), 1); self.assertEqual(len(self.capture[1]), 1)

@@ -54,8 +54,18 @@ parser.add_argument("--mg-step-norm", type=float, default=0.5,
                     help="Euclidean norm of each rank-local temporary step, as in Tiny PR #99.")
 parser.add_argument("--probe-every", type=int, default=0,
                     help="Read-only probes before update 1 and every N updates thereafter; 0 disables.")
-parser.add_argument("--probe-modes", type=str, default="mlp",
+parser.add_argument("--probe-modes", type=str, default="qk,v,mlp",
                     help="Comma-separated matrix groups to probe: mlp,qk,v.")
+parser.add_argument("--probe-pairs", type=int, default=1,
+                    help="Probe this many virtual-rank A/B episodes using the same pairs for every matrix group.")
+parser.add_argument("--probe-pair-offset", type=int, default=0,
+                    help="Skip this many A/B pairs in standalone alignment profiling to sample another data block.")
+parser.add_argument("--probe-alignment-only", action="store_true",
+                    help="Measure raw A/B gradient interaction without the additional Muon/decay trials.")
+parser.add_argument("--probe-only", action="store_true",
+                    help="Write one diagnostic event and exit without applying an optimizer update.")
+parser.add_argument("--init-model", type=str, default=None,
+                    help="Load a saved parameter dictionary before training/profiling; optimizer starts fresh.")
 parser.add_argument("--probe-radii", type=str, default="0.1,0.5",
                     help="Comma-separated equal Euclidean radii for raw/Muon direction comparisons.")
 parser.add_argument("--num-epochs", type=int, default=15)
@@ -131,6 +141,12 @@ parser.add_argument("--eval-tokens", type=int, default=10_000_000,
 parser.add_argument("--xsa-mode", choices=("off", "first6"), default="off",
                     help="Exclusive self-attention schedule.")
 args = parser.parse_args()
+if not 1 <= args.probe_pairs <= args.virtual_ranks:
+    raise ValueError("--probe-pairs must be between 1 and --virtual-ranks")
+if args.probe_pair_offset < 0 or (args.probe_pair_offset > 0 and not (args.probe_only and args.probe_alignment_only)):
+    raise ValueError("--probe-pair-offset must be nonnegative and requires standalone alignment profiling")
+if args.probe_only and args.probe_every <= 0:
+    raise ValueError("--probe-only requires --probe-every > 0")
 probe_modes = tuple(args.probe_modes.split(","))
 probe_radii = tuple(float(x) for x in args.probe_radii.split(","))
 if args.probe_every < 0 or not probe_modes or any(m not in {"mlp", "qk", "v"} for m in probe_modes):
@@ -1214,6 +1230,9 @@ with torch.device("meta"):
     model = GPT(config)
 model.to_empty(device=device)
 model.init_weights()
+if args.init_model:
+    model.load_state_dict(torch.load(args.init_model, map_location="cpu", weights_only=True), strict=True)
+    print0(f"Loaded parameters from {args.init_model}; optimizer state starts fresh")
 
 param_counts = sum(p.numel() for p in model.parameters())
 transformer_params = sum(p.numel() for p in model.transformer.h.parameters())
@@ -1392,12 +1411,24 @@ while current_epoch <= args.num_epochs:
         with autocast_ctx:
             return model(batch_x, batch_y, num_iterations=active_num_iterations)
 
-    capture_episode = ([], []) if args.probe_every > 0 and step % args.probe_every == 0 else None
-    train_loss, x, y, epoch = collect_virtual_gradients(
-        model, trainable_params, trial_params, x, y, lambda: next(train_loader),
-        forward_loss, scaler, args.virtual_ranks, microsteps_per_half, args.mg_step_norm,
-        capture_episode=capture_episode,
-    )
+    capture_episodes = [([], []) for _ in range(args.probe_pairs)] if args.probe_every > 0 and step % args.probe_every == 0 else None
+    if args.probe_only and args.probe_alignment_only:
+        # Standalone alignment profiling needs samples, not the actual training gradient.
+        # Avoid an unnecessary full training backward before the diagnostic backward passes.
+        for _ in range(args.probe_pair_offset * 2 * microsteps_per_half):
+            x, y, epoch = next(train_loader)
+        for episode in capture_episodes:
+            for half in episode:
+                for _ in range(microsteps_per_half):
+                    half.append((x.detach(), y.detach()))
+                    x, y, epoch = next(train_loader)
+        train_loss = x.new_zeros((), dtype=torch.float32)
+    else:
+        train_loss, x, y, epoch = collect_virtual_gradients(
+            model, trainable_params, trial_params, x, y, lambda: next(train_loader),
+            forward_loss, scaler, args.virtual_ranks, microsteps_per_half, args.mg_step_norm,
+            capture_episodes=capture_episodes,
+        )
 
     # Update optimizer
     lrm = get_lr_multiplier(step)
@@ -1423,7 +1454,7 @@ while current_epoch <= args.num_epochs:
         group["weight_decay"] = group["initial_wd"] * wd_scale
         if group['kind'] == 'muon':
             group["momentum"] = get_muon_momentum(step)
-    if capture_episode is not None:
+    if capture_episodes is not None:
         print0(f"Read-only A/B probes before update {step + 1}: {probe_modes}")
         probe_start = time.time()
         # Use the production function's eager body; avoid extra diagnostic compile shapes.
@@ -1431,32 +1462,51 @@ while current_epoch <= args.num_epochs:
         def probe_forward_loss(batch_x, batch_y):
             with autocast_ctx:
                 return orig_model(batch_x, batch_y, num_iterations=active_num_iterations)
-        measurements = probe_episode(
-            orig_model, optimizer, orig_model.named_parameters(), *capture_episode,
-            probe_forward_loss, probe_muon, scaler.get_scale(), modes=probe_modes, radii=probe_radii,
-        )
+        measurements = []
+        episodes = []
+        for pair_index, (a_batches, b_batches) in enumerate(capture_episodes, start=args.probe_pair_offset):
+            pair_measurements = probe_episode(
+                orig_model, optimizer, orig_model.named_parameters(), a_batches, b_batches,
+                probe_forward_loss, probe_muon, scaler.get_scale(), modes=probe_modes, radii=probe_radii,
+                alignment_only=args.probe_alignment_only,
+            )
+            for measurement in pair_measurements: measurement["pair_index"] = pair_index
+            measurements.extend(pair_measurements)
+            episodes.append(dict(pair_index=pair_index, sequences_a=sum(a.size(0) for a, b in a_batches),
+                                 sequences_b=sum(a.size(0) for a, b in b_batches),
+                                 tokens_a=sum(a.numel() for a, b in a_batches),
+                                 tokens_b=sum(a.numel() for a, b in b_batches)))
         synchronize()
         record = dict(update=step + 1, epoch=current_epoch, mg_mode=args.mg_mode,
                       precision=args.precision, num_iterations=active_num_iterations,
                       backprop_iterations=min(TRAIN_BACKPROP_ITERATIONS, active_num_iterations),
                       gradient_scale=scaler.get_scale(), dropout_enabled=False,
-                      virtual_rank=0, tokens_a=sum(a.numel() for a, b in capture_episode[0]),
-                      tokens_b=sum(a.numel() for a, b in capture_episode[1]),
+                      schema_version=2, probe_pairs=args.probe_pairs, pair_offset=args.probe_pair_offset, episodes=episodes,
+                      init_model=args.init_model, optimizer_state="fresh" if step == 0 else "live",
+                      probe_only=args.probe_only, alignment_only=args.probe_alignment_only,
                       matrix_lr=MATRIX_LR * lrm, weight_decay=wd,
                       probe_seconds=time.time() - probe_start, measurements=measurements)
         if master_process:
             with open(os.path.join(run_dir, "probes.jsonl"), "a") as probe_file:
                 probe_file.write(json.dumps(record, allow_nan=False) + "\n")
         for measurement in measurements:
-            native = next(t for t in measurement["trials"] if t["kind"] == "muon_a_native")
-            combined = next(t for t in measurement["trials"] if t["kind"] == "muon_a_plus_decay_native")
             alignment = measurement["cosine_a_b"]
             alignment_str = f"{alignment:.4f}" if alignment is not None else "undefined (zero norm)"
-            print0(f"probe {measurement['mode']} | weight norm: {measurement['weight_norm']:.4f} "
-                   f"| cos(A,B): {alignment_str} | Muon A delta B: {native['b_loss_change']:+.6f} "
-                   f"| Muon A + decay delta B: {combined['b_loss_change']:+.6f}")
+            print0(f"probe pair {measurement['pair_index']} {measurement['mode']} "
+                   f"| weight norm: {measurement['weight_norm']:.4f} | cos(A,B): {alignment_str}")
+            for trial in measurement["trials"]:
+                if trial["kind"] == "raw_a":
+                    print0(f"  radius {trial['radius']} | delta B: {trial['b_loss_change']:+.6f} "
+                           f"| cos(B,Bprime): {trial['cosine_b_b_prime']} "
+                           f"| relative gradient change: {trial['relative_b_gradient_change']}")
         print0(f"Probes saved ({record['probe_seconds']:.1f}s)")
-        del capture_episode, measurements
+        del capture_episodes, measurements
+        if args.probe_only:
+            print0("Profiling complete; no optimizer update applied")
+            wandb_run.finish()
+            if dist.is_initialized(): dist.destroy_process_group()
+            sys.stdout.flush(); sys.stderr.flush()
+            raise SystemExit(0)
     scaler.unscale_(optimizer)
     scale_before_step = scaler.get_scale()
     scaler.step(optimizer)

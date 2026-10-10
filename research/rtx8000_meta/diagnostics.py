@@ -25,6 +25,17 @@ def _ratio(a, b):
     return a / b if b > 0 else None
 
 
+def _interaction(ga, gb, gb_prime):
+    correction = [new - old for new, old in zip(gb_prime, gb)]
+    bnorm, pnorm, cnorm = _norm(gb), _norm(gb_prime), _norm(correction)
+    return dict(cosine_a_b_prime=_cos(ga, gb_prime),
+                relative_b_gradient_change=_ratio(cnorm, bnorm),
+                cosine_a_b_correction=_cos(ga, correction),
+                cosine_b_b_prime=_cos(gb, gb_prime),
+                b_prime_norm=pnorm, b_prime_norm_ratio=_ratio(pnorm, bnorm),
+                b_correction_norm=cnorm)
+
+
 @contextmanager
 def _probe_context(model, params):
     originals = [p.detach().clone() for p in params]
@@ -104,7 +115,7 @@ def preview_muon(optimizer, params, grads, muon_step):
 
 
 def probe_episode(model, optimizer, named_parameters, a_batches, b_batches, forward_loss,
-                  muon_step, scale, modes=('mlp',), radii=(.1, .5)):
+                  muon_step, scale, modes=('mlp',), radii=(.1, .5), alignment_only=False):
     """Probe the first virtual-rank episode, at unadapted theta before the real update.
 
     Existing p.grad contains the actual averaged meta-training gradient, still scaled.
@@ -124,26 +135,33 @@ def probe_episode(model, optimizer, named_parameters, a_batches, b_batches, forw
             loss_a, ga = _gradients(forward_loss, a_batches, params, scale)
             loss_b, gb = _gradients(forward_loss, b_batches, params, scale)
             # Missing training gradients must not silently become active zero updates.
-            if any(p.grad is None for p in params): raise ValueError('Missing selected training gradient')
-            train_grads = [p.grad.detach() / scale for p in params]
-            da, wa, ma = preview_muon(optimizer, params, ga, muon_step)
-            dt, wt, mt = preview_muon(optimizer, params, train_grads, muon_step)
+            if not alignment_only:
+                if any(p.grad is None for p in params): raise ValueError('Missing selected training gradient')
+                train_grads = [p.grad.detach() / scale for p in params]
+                da, wa, ma = preview_muon(optimizer, params, ga, muon_step)
+                dt, wt, mt = preview_muon(optimizer, params, train_grads, muon_step)
             weight_norm, anorm, bnorm = _norm(originals), _norm(ga), _norm(gb)
-            muon_norm = _norm(da)
+            muon_norm = _norm(da) if not alignment_only else 0.0
             tensors = []
-            for p, w, a, b, d, decay, mask in zip(params, originals, ga, gb, da, wa, ma):
-                wn, dn = _norm([w]), _norm([d])
-                tensors.append(dict(name=names[id(p)], parameters=p.numel(), weight_norm=wn,
-                                    gradient_a_norm=_norm([a]), gradient_b_norm=_norm([b]),
-                                    cosine_a_b=_cos([a], [b]), cosine_b_muon_displacement=_cos([b], [d]),
-                                    muon_a_step_norm=dn, muon_a_relative_step=_ratio(dn, wn),
-                                    decay_a_norm=_norm([decay]), decay_a_fraction=float(mask.float().mean())))
+            for i, (p, w, a, b) in enumerate(zip(params, originals, ga, gb)):
+                wn = _norm([w])
+                tensor = dict(name=names[id(p)], parameters=p.numel(), weight_norm=wn,
+                              gradient_a_norm=_norm([a]), gradient_b_norm=_norm([b]),
+                              cosine_a_b=_cos([a], [b]))
+                if not alignment_only:
+                    d, decay, mask = da[i], wa[i], ma[i]
+                    dn = _norm([d])
+                    tensor.update(cosine_b_muon_displacement=_cos([b], [d]),
+                                  muon_a_step_norm=dn, muon_a_relative_step=_ratio(dn, wn),
+                                  decay_a_norm=_norm([decay]), decay_a_fraction=float(mask.float().mean()))
+                tensors.append(tensor)
             # Parameter-wise diagnostics above also let us aggregate by layer offline.
             def scenarios():
                 # Construct one trial at a time: retaining every MLP-sized delta
                 # simultaneously can consume several extra GB on a 16-GB card.
-                if anorm > 0:
-                    for radius in radii: yield 'raw_a', radius, [-radius * g / anorm for g in ga]
+                for radius in radii:
+                    yield 'raw_a', radius, [-radius * g / anorm if anorm > 0 else torch.zeros_like(g) for g in ga]
+                if alignment_only: return
                 if muon_norm > 0:
                     for radius in radii: yield 'muon_a_matched_radius', radius, [radius * d / muon_norm for d in da]
                 yield 'muon_a_native', None, da
@@ -157,15 +175,25 @@ def probe_episode(model, optimizer, named_parameters, a_batches, b_batches, forw
                 with torch.no_grad():
                     # Absolute reconstruction avoids add/undo floating-point drift.
                     for p, original, d in zip(params, originals, delta): p.copy_(original + d)
-                    trial_loss = sum(float(forward_loss(x, y)) for x, y in b_batches) / len(b_batches)
+                if kind == 'raw_a':
+                    trial_loss, gb_prime = _gradients(forward_loss, b_batches, params, scale)
+                    interaction = _interaction(ga, gb, gb_prime)
+                    interaction['matrices'] = [dict(name=names[id(p)], **_interaction([a], [b], [new]))
+                                               for p, a, b, new in zip(params, ga, gb, gb_prime)]
+                    del gb_prime
+                else:
+                    with torch.no_grad():
+                        trial_loss = sum(float(forward_loss(x, y)) for x, y in b_batches) / len(b_batches)
+                    interaction = {}
                 dn = _norm(delta)
                 predicted = _dot(gb, delta)
                 trials.append(dict(kind=kind, radius=radius, step_norm=dn,
                                    relative_step=_ratio(dn, weight_norm), b_loss=trial_loss,
                                    b_loss_change=trial_loss - loss_b,
                                    first_order_b_loss_change=predicted,
-                                   nonlinear_residual=trial_loss - loss_b - predicted))
+                                   nonlinear_residual=trial_loss - loss_b - predicted, **interaction))
             results.append(dict(mode=mode, a_loss=loss_a, b_loss=loss_b, weight_norm=weight_norm,
                                 gradient_a_norm=anorm, gradient_b_norm=bnorm, cosine_a_b=_cos(ga, gb),
-                                cosine_b_muon_displacement=_cos(gb, da), matrices=tensors, trials=trials))
+                                cosine_b_muon_displacement=_cos(gb, da) if not alignment_only else None,
+                                alignment_only=alignment_only, matrices=tensors, trials=trials))
     return results
