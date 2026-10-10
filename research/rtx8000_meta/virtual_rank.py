@@ -32,8 +32,12 @@ def _temporary_step(trial_params, step_norm):
     direction = [p.grad.detach().clone() if p.grad is not None else torch.zeros_like(p)
                  for p in trial_params]
     norm = torch.linalg.vector_norm(torch.stack(torch._foreach_norm(direction)))
-    if not bool(torch.isfinite(norm)) or not bool(norm > 0):
+    if not bool(torch.isfinite(norm)):
         raise FloatingPointError(f"Invalid temporary A-gradient norm: {norm.item()}")
+    if norm.item() == 0:
+        # Zero-initialized attention output projections block Q/K/V gradients
+        # on the first optimizer step. There is no direction to normalize yet.
+        return None
     alpha = -step_norm / norm.item()
     torch._foreach_add_(trial_params, direction, alpha=alpha)
     return original_weights

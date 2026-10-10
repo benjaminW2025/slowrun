@@ -3,7 +3,7 @@ import unittest
 import torch
 from torch import nn
 
-from virtual_rank import collect_virtual_gradients, select_trial_parameters
+from virtual_rank import collect_virtual_gradients, select_trial_parameters, _temporary_step
 
 
 class FixedScaler:
@@ -93,6 +93,43 @@ class VirtualRankTests(unittest.TestCase):
 
     def test_multiple_microbatches_per_half(self):
         self.run_case(use_trial=True, scale=128.0, microsteps_per_half=2)
+
+    def test_zero_initialized_output_blocks_trial_gradient(self):
+        model = TinyModel()
+        with torch.no_grad():
+            model.other.weight.zero_()
+        params = list(model.parameters())
+        original = [p.detach().clone() for p in params]
+        expected = reference_grads(model, self.batches, False, 0.5, 1)
+        batch_iter = iter(self.batches[1:] + [self.batches[0]])
+        collect_virtual_gradients(
+            model, params, [model.trial.weight], *self.batches[0],
+            lambda: (*next(batch_iter), 1), model, FixedScaler(128.0),
+            virtual_ranks=2, microsteps_per_half=1, step_norm=0.5,
+        )
+        for p, before, want in zip(params, original, expected):
+            torch.testing.assert_close(p, before, rtol=0, atol=0)
+            torch.testing.assert_close(p.grad / 128.0, want)
+        self.assertEqual(params[0].grad.norm().item(), 0.0)
+        self.assertGreater(params[1].grad.norm().item(), 0.0)
+        with torch.no_grad():
+            for p in params:
+                p.add_(p.grad / 128.0, alpha=-0.1)
+        model.zero_grad(set_to_none=True)
+        model(*self.batches[0]).backward()
+        self.assertGreater(params[0].grad.norm().item(), 0.0)
+        before = params[0].detach().clone()
+        saved = _temporary_step([params[0]], 0.5)
+        self.assertIsNotNone(saved)
+        torch.testing.assert_close((params[0] - before).norm(), torch.tensor(0.5))
+
+    def test_nonfinite_trial_gradient_still_raises(self):
+        p = nn.Parameter(torch.ones(2, 2))
+        for value in (float('nan'), float('inf')):
+            p.grad = torch.full_like(p, value)
+            with self.assertRaises(FloatingPointError):
+                _temporary_step([p], 0.5)
+            torch.testing.assert_close(p, torch.ones_like(p), rtol=0, atol=0)
 
     def test_matrix_selection(self):
         weights = {
