@@ -1108,16 +1108,25 @@ ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
 master_process = ddp_rank == 0
 torch.manual_seed(args.seed)
 
-if ddp and torch.cuda.is_available():
+cuda_available = torch.cuda.is_available()
+if not cuda_available and args.precision == "fp16":
+    raise RuntimeError(
+        "FP16 experiments require CUDA, but CUDA initialization failed or no GPU is visible. "
+        "Refusing to fall back to CPU. Check the host/GPU allocation and test torch.cuda.init() "
+        "in this same shell before relaunching."
+    )
+
+if ddp and cuda_available:
     device = torch.device("cuda", ddp_local_rank)
     torch.cuda.set_device(device)
     torch.cuda.manual_seed(args.seed)
     dist.init_process_group(backend="nccl", device_id=device)
     dist.barrier()
 else:
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda" if cuda_available else "cpu")
 
 device_type = device.type
+print0(f"Compute device: {device}" + (f" | {torch.cuda.get_device_name(device)}" if cuda_available else " | explicit FP32 CPU reference"))
 autocast_ctx = (
     torch.amp.autocast(device_type="cuda", dtype=torch.float16)
     if device_type == "cuda" and args.precision == "fp16" else nullcontext()
