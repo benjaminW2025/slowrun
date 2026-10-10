@@ -29,6 +29,7 @@ import numpy as np
 
 import tiktoken
 from virtual_rank import collect_virtual_gradients, select_trial_parameters
+from diagnostics import probe_episode
 
 _script_start = time.time()
 
@@ -51,6 +52,12 @@ parser.add_argument("--mg-mode", choices=("off", "mlp", "qk", "v"), default="off
                     help="Matrices receiving the temporary A-gradient step; off is the paired baseline.")
 parser.add_argument("--mg-step-norm", type=float, default=0.5,
                     help="Euclidean norm of each rank-local temporary step, as in Tiny PR #99.")
+parser.add_argument("--probe-every", type=int, default=0,
+                    help="Read-only probes before update 1 and every N updates thereafter; 0 disables.")
+parser.add_argument("--probe-modes", type=str, default="mlp",
+                    help="Comma-separated matrix groups to probe: mlp,qk,v.")
+parser.add_argument("--probe-radii", type=str, default="0.1,0.5",
+                    help="Comma-separated equal Euclidean radii for raw/Muon direction comparisons.")
 parser.add_argument("--num-epochs", type=int, default=15)
 parser.add_argument("--patience", type=int, default=-1)
 parser.add_argument("--run-name", type=str, default=None,
@@ -124,6 +131,12 @@ parser.add_argument("--eval-tokens", type=int, default=10_000_000,
 parser.add_argument("--xsa-mode", choices=("off", "first6"), default="off",
                     help="Exclusive self-attention schedule.")
 args = parser.parse_args()
+probe_modes = tuple(args.probe_modes.split(","))
+probe_radii = tuple(float(x) for x in args.probe_radii.split(","))
+if args.probe_every < 0 or not probe_modes or any(m not in {"mlp", "qk", "v"} for m in probe_modes):
+    raise ValueError("Invalid --probe-every or --probe-modes")
+if not probe_radii or any(not math.isfinite(r) or r <= 0 for r in probe_radii):
+    raise ValueError("--probe-radii must contain positive finite numbers")
 if args.mg_step_norm <= 0:
     raise ValueError("--mg-step-norm must be positive")
 if args.loss_scale <= 0:
@@ -1133,8 +1146,8 @@ if master_process:
     os.makedirs(checkpoints_dir, exist_ok=True)
     os.makedirs(os.path.join(run_dir, "wandb"), exist_ok=True)
     shutil.copy2(__file__, os.path.join(run_dir, "train.py"))
-    shutil.copy2(os.path.join(os.path.dirname(__file__), "virtual_rank.py"),
-                 os.path.join(run_dir, "virtual_rank.py"))
+    for helper in ("virtual_rank.py", "diagnostics.py"):
+        shutil.copy2(os.path.join(os.path.dirname(__file__), helper), os.path.join(run_dir, helper))
 if dist.is_initialized():
     dist.barrier()
 artifacts_log_f = open(terminal_log_path, "a", encoding="utf-8", buffering=1)
@@ -1379,9 +1392,11 @@ while current_epoch <= args.num_epochs:
         with autocast_ctx:
             return model(batch_x, batch_y, num_iterations=active_num_iterations)
 
+    capture_episode = ([], []) if args.probe_every > 0 and step % args.probe_every == 0 else None
     train_loss, x, y, epoch = collect_virtual_gradients(
         model, trainable_params, trial_params, x, y, lambda: next(train_loader),
         forward_loss, scaler, args.virtual_ranks, microsteps_per_half, args.mg_step_norm,
+        capture_episode=capture_episode,
     )
 
     # Update optimizer
@@ -1408,6 +1423,40 @@ while current_epoch <= args.num_epochs:
         group["weight_decay"] = group["initial_wd"] * wd_scale
         if group['kind'] == 'muon':
             group["momentum"] = get_muon_momentum(step)
+    if capture_episode is not None:
+        print0(f"Read-only A/B probes before update {step + 1}: {probe_modes}")
+        probe_start = time.time()
+        # Use the production function's eager body; avoid extra diagnostic compile shapes.
+        probe_muon = getattr(muon_step_fused, "_torchdynamo_orig_callable", muon_step_fused)
+        def probe_forward_loss(batch_x, batch_y):
+            with autocast_ctx:
+                return orig_model(batch_x, batch_y, num_iterations=active_num_iterations)
+        measurements = probe_episode(
+            orig_model, optimizer, orig_model.named_parameters(), *capture_episode,
+            probe_forward_loss, probe_muon, scaler.get_scale(), modes=probe_modes, radii=probe_radii,
+        )
+        synchronize()
+        record = dict(update=step + 1, epoch=current_epoch, mg_mode=args.mg_mode,
+                      precision=args.precision, num_iterations=active_num_iterations,
+                      backprop_iterations=min(TRAIN_BACKPROP_ITERATIONS, active_num_iterations),
+                      gradient_scale=scaler.get_scale(), dropout_enabled=False,
+                      virtual_rank=0, tokens_a=sum(a.numel() for a, b in capture_episode[0]),
+                      tokens_b=sum(a.numel() for a, b in capture_episode[1]),
+                      matrix_lr=MATRIX_LR * lrm, weight_decay=wd,
+                      probe_seconds=time.time() - probe_start, measurements=measurements)
+        if master_process:
+            with open(os.path.join(run_dir, "probes.jsonl"), "a") as probe_file:
+                probe_file.write(json.dumps(record, allow_nan=False) + "\n")
+        for measurement in measurements:
+            native = next(t for t in measurement["trials"] if t["kind"] == "muon_a_native")
+            combined = next(t for t in measurement["trials"] if t["kind"] == "muon_a_plus_decay_native")
+            alignment = measurement["cosine_a_b"]
+            alignment_str = f"{alignment:.4f}" if alignment is not None else "undefined (zero norm)"
+            print0(f"probe {measurement['mode']} | weight norm: {measurement['weight_norm']:.4f} "
+                   f"| cos(A,B): {alignment_str} | Muon A delta B: {native['b_loss_change']:+.6f} "
+                   f"| Muon A + decay delta B: {combined['b_loss_change']:+.6f}")
+        print0(f"Probes saved ({record['probe_seconds']:.1f}s)")
+        del capture_episode, measurements
     scaler.unscale_(optimizer)
     scale_before_step = scaler.get_scale()
     scaler.step(optimizer)

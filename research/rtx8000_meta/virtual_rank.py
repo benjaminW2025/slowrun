@@ -55,6 +55,7 @@ def collect_virtual_gradients(
     virtual_ranks,
     microsteps_per_half,
     step_norm,
+    capture_episode=None,
 ):
     """Run rank-local A/B trials and leave their averaged gradient in p.grad.
 
@@ -74,12 +75,14 @@ def collect_virtual_gradients(
     train_loss = x.new_zeros((), dtype=torch.float32)
     epoch = None
 
-    for _ in range(virtual_ranks):
+    for virtual_rank in range(virtual_ranks):
         model.zero_grad(set_to_none=True)
         original_weights = None
         try:
             for half in range(2):
                 for _ in range(microsteps_per_half):
+                    if capture_episode is not None and virtual_rank == 0:
+                        capture_episode[half].append((x.detach(), y.detach()))
                     loss = forward_loss(x, y)
                     train_loss = train_loss + loss.detach() / total_microsteps
                     scaler.scale(loss).backward()
