@@ -1300,6 +1300,7 @@ if eval_steps < 1:
     raise ValueError("--eval-tokens must cover at least one device batch")
 param_ema_beta = args.ema_decay_per_epoch ** (args.update_ema_every / steps_per_epoch) if args.update_ema_every > 0 else 0
 ema_params = [torch.zeros_like(p) for p in model.parameters()] if args.update_ema_every > 0 else None
+ema_updates = 0
 
 wall_clock_start = time.time()
 _swa_start_step = (num_train_steps - args.swa_last_epochs * steps_per_epoch) if args.swa_last_epochs > 0 else -1
@@ -1418,6 +1419,7 @@ while current_epoch <= args.num_epochs:
     model.zero_grad(set_to_none=True)
     if ema_params is not None and step % args.update_ema_every == 0:
         torch._foreach_lerp_(ema_params, list(model.parameters()), 1 - param_ema_beta)
+        ema_updates += 1
     train_loss_f = train_loss.item()
     synchronize()
     dt = time.time() - t0
@@ -1478,14 +1480,16 @@ while current_epoch <= args.num_epochs:
             "val/train_expected_effective_layers": DEPTH * active_expected_num_iterations,
             "val/train_actual_effective_layers": DEPTH * active_num_iterations,
         })
-        # Save checkpoint for weight averaging
-        ckpt_path = os.path.join(checkpoints_dir, f"epoch_{current_epoch:03d}.pt")
-        if master_process:
-            torch.save({n: p.data.float().cpu() for n, p in orig_model.named_parameters()}, ckpt_path)
-        late_ckpt_paths.append(ckpt_path)
-        if len(late_ckpt_paths) > args.swa_last_epochs:
-            old = late_ckpt_paths.pop(0)
-            if master_process and os.path.exists(old): os.remove(old)
+        # Only collect checkpoints inside the scheduled SWA window.
+        if _swa_start_step >= 0 and step >= _swa_start_step:
+            # Save checkpoint for weight averaging
+            ckpt_path = os.path.join(checkpoints_dir, f"epoch_{current_epoch:03d}.pt")
+            if master_process:
+                torch.save({n: p.data.float().cpu() for n, p in orig_model.named_parameters()}, ckpt_path)
+            late_ckpt_paths.append(ckpt_path)
+            if len(late_ckpt_paths) > args.swa_last_epochs:
+                old = late_ckpt_paths.pop(0)
+                if master_process and os.path.exists(old): os.remove(old)
         # Early stopping / best-val tracking only compare max-iteration evals.
         if eval_num_iterations == NUM_ITERATIONS:
             if val_bpb < min_val_bpb:
@@ -1519,12 +1523,12 @@ with autocast_ctx:
 print0(f"Final raw Val BPB: {raw_final_bpb:.6f} | Val Loss: {raw_final_loss:.6f} | iters: {NUM_ITERATIONS}")
 wandb_run.log({"step": step, "val/raw_final_bpb": raw_final_bpb, "val/raw_final_loss": raw_final_loss})
 val_bpb, val_loss = raw_final_bpb, raw_final_loss
+model_variant = "raw"
 if raw_final_bpb < min_val_bpb:
     min_val_bpb, min_val_loss = raw_final_bpb, raw_final_loss
 
 # Final EMA evaluation
 if ema_params is not None:
-    ema_updates = step // args.update_ema_every
     if ema_updates > 0:
         correction = 1.0 / (1.0 - param_ema_beta ** ema_updates)
         model.eval()
@@ -1545,6 +1549,7 @@ if ema_params is not None:
         })
         val_bpb = ema_bpb
         val_loss = ema_loss
+        model_variant = "ema"
         if ema_bpb < min_val_bpb:
             min_val_bpb = ema_bpb
             min_val_loss = ema_loss
@@ -1573,6 +1578,8 @@ if len(late_ckpt_paths) >= 2:
         avg_bpb, avg_loss = evaluate_bpb(model, build_val_loader(), eval_steps, token_bytes, num_iterations=NUM_ITERATIONS)
     print0(f"Ckpt avg Val BPB: {avg_bpb:.6f} | Val Loss: {avg_loss:.6f} | iters: {NUM_ITERATIONS}")
     wandb_run.log({"ckpt_avg/bpb": avg_bpb, "ckpt_avg/loss": avg_loss, "ckpt_avg/num_iterations": NUM_ITERATIONS})
+    val_bpb, val_loss = avg_bpb, avg_loss
+    model_variant = "checkpoint_average"
     if avg_loss < min_val_loss:
         min_val_loss, min_val_bpb = avg_loss, avg_bpb
 
@@ -1590,6 +1597,12 @@ wandb_run.summary["best_val_loss"] = min_val_loss
 
 if master_process:
     result = {
+        "meta_source_submission": "45bf3fd",
+        "model_variant": model_variant,
+        "model_path": artifact_model_path,
+        "ema_updates": ema_updates,
+        "checkpoint_average_count": len(late_ckpt_paths),
+        "arguments": vars(args),
         "source_submission": "a2c443e18f99d0f6e35c6013c752e636fe402213",
         "seed": args.seed,
         "precision": args.precision,
