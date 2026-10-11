@@ -49,10 +49,14 @@ parser.add_argument("--no-compile", action="store_true",
                     help="Disable model torch.compile for a quick correctness smoke test.")
 parser.add_argument("--virtual-ranks", type=int, default=8,
                     help="Sequentially simulate this many independent rank-local A/B episodes per optimizer step.")
-parser.add_argument("--mg-mode", choices=("off", "mlp", "qk", "v", "qkv"), default="off",
+parser.add_argument("--mg-mode", choices=("off", "mlp", "qk", "v", "qkv", "mlp_v"), default="off",
                     help="Matrices receiving the temporary A-gradient step; off is the paired baseline.")
 parser.add_argument("--mg-step-norm", type=float, default=0.5,
                     help="Euclidean norm of each rank-local temporary step, as in Tiny PR #99.")
+parser.add_argument("--mg-mlp-step-norm", type=float, default=0.5,
+                    help="Independent MLP temporary-step norm in mlp_v mode; zero disables that perturbation.")
+parser.add_argument("--mg-v-step-norm", type=float, default=0.1,
+                    help="Independent V temporary-step norm in mlp_v mode; zero disables that perturbation.")
 parser.add_argument("--probe-every", type=int, default=0,
                     help="Read-only probes before update 1 and every N updates thereafter; 0 disables.")
 parser.add_argument("--probe-modes", type=str, default="qk,v,mlp",
@@ -164,7 +168,9 @@ if args.probe_every < 0 or not probe_modes or any(m not in {"mlp", "qk", "v", "q
     raise ValueError("Invalid --probe-every or --probe-modes")
 if not probe_radii or any(not math.isfinite(r) or r <= 0 for r in probe_radii):
     raise ValueError("--probe-radii must contain positive finite numbers")
-if args.mg_step_norm <= 0:
+if any(not math.isfinite(r) or r < 0 for r in (args.mg_mlp_step_norm, args.mg_v_step_norm)):
+    raise ValueError("MLP/V step norms must be nonnegative and finite")
+if not math.isfinite(args.mg_step_norm) or args.mg_step_norm <= 0:
     raise ValueError("--mg-step-norm must be positive")
 if args.loss_scale <= 0:
     raise ValueError("--loss-scale must be positive")
@@ -1288,6 +1294,13 @@ optimizer = model.setup_optimizer()
 muon_ids = {id(p) for group in optimizer.param_groups if group["kind"] == "muon"
             for p in group["params"]}
 trial_params = select_trial_parameters(orig_model.named_parameters(), muon_ids, args.mg_mode)
+trial_groups = None
+if args.mg_mode == "mlp_v":
+    trial_groups = [
+        (select_trial_parameters(orig_model.named_parameters(), muon_ids, "mlp"), args.mg_mlp_step_norm),
+        (select_trial_parameters(orig_model.named_parameters(), muon_ids, "v"), args.mg_v_step_norm),
+    ]
+    print0(f"Independent temporary-step norms: MLP={args.mg_mlp_step_norm}, V={args.mg_v_step_norm}")
 print0(f"Temporary-step matrices: {args.mg_mode}: {len(trial_params)} tensors, "
        f"{sum(p.numel() for p in trial_params):,} parameters")
 trainable_params = [p for p in orig_model.parameters() if p.requires_grad]
@@ -1459,7 +1472,7 @@ while current_epoch <= args.num_epochs:
         train_loss, x, y, epoch = collect_virtual_gradients(
             model, trainable_params, trial_params, x, y, lambda: next(train_loader),
             forward_loss, scaler, args.virtual_ranks, microsteps_per_half, args.mg_step_norm,
-            capture_episodes=capture_episodes,
+            capture_episodes=capture_episodes, trial_groups=trial_groups,
         )
 
     # Update optimizer
@@ -1786,6 +1799,8 @@ if master_process:
         "virtual_ranks": args.virtual_ranks,
         "mg_mode": args.mg_mode,
         "mg_step_norm": args.mg_step_norm,
+        "mg_mlp_step_norm": args.mg_mlp_step_norm if args.mg_mode == "mlp_v" else None,
+        "mg_v_step_norm": args.mg_v_step_norm if args.mg_mode == "mlp_v" else None,
         "device_batch_size": args.device_batch_size,
         "total_batch_size": TOTAL_BATCH_SIZE,
         "schedule_steps": args.schedule_steps,

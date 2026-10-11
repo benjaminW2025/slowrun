@@ -254,3 +254,39 @@ update norm for C evaluation. Zero A adaptation is already represented by the
 ordinary paired baseline, so it does not require a zero-radius trial. Checkpoint
 profiles still start with fresh optimizer state. These runs measure transfer;
 they are not training runs and do not establish a long-run improvement.
+
+
+### Corrected baseline confirmation and combined MLP/V training
+
+`--mg-mode mlp_v` computes A once, perturbs MLP and V simultaneously with
+separate group-wide norms (`--mg-mlp-step-norm`, default 0.5;
+`--mg-v-step-norm`, default 0.1), computes B once at that joint trial, restores
+all perturbed weights, then combines A/Bprime across virtual ranks before the
+usual Muon/Adam step. Zero group norms disable only that temporary perturbation,
+not ordinary training. Other matrices continue receiving gradients and updates.
+The effective total temporary norm is sqrt(mlp_norm^2 + v_norm^2) when both
+A gradients are nonzero. No extra Muon step or optimizer state update is added.
+
+`run_training.sh ARM GPU SEED` launches fresh training from initialization, not
+from the old audit checkpoint. Defaults: seed 42, 500 max/schedule steps, FP16
+scale 128, one sequence per device microbatch, eight virtual ranks, 524288 tokens
+per update, 32768 validation tokens, no compilation, unchanged recurrence and
+optimizer defaults. This is an adapted PR-style comparison, not the full
+original PR recipe. Run each command in tmux on its own allocated GPU:
+
+```bash
+bash research/rtx8000_meta/run_training.sh off 0 42
+bash research/rtx8000_meta/run_training.sh qk 1 42
+bash research/rtx8000_meta/run_training.sh v 2 42
+bash research/rtx8000_meta/run_training.sh mlp 3 42
+MG_V_STEP_NORM=0.05 bash research/rtx8000_meta/run_training.sh mlp_v 4 42
+MG_V_STEP_NORM=0.1 bash research/rtx8000_meta/run_training.sh mlp_v 5 42
+```
+
+The four baseline arms use step norm 0.5 (ignored for off). The combined arm
+holds MLP at 0.5. Environment overrides: `TRAIN_STEPS`, `MG_STEP_NORM`,
+`MG_MLP_STEP_NORM`, `MG_V_STEP_NORM`. Unique run names include settings and seed;
+results record both independent radii. Compare corresponding validation curves
+and the same final weight variant, then repeat contenders with another seed.
+To attribute a combined gain to interaction rather than the smaller V radius,
+also run V alone at the matching radius (`MG_STEP_NORM=0.05` or `0.1`).

@@ -71,7 +71,7 @@ class FullTrainingTests(unittest.TestCase):
 
     def test_all_arms_cross_recurrence_transition_and_save_finite_models(self):
         with tempfile.TemporaryDirectory() as temp:
-            for mode in ('off', 'qk', 'v', 'qkv', 'mlp'):
+            for mode in ('off', 'qk', 'v', 'qkv', 'mlp', 'mlp_v'):
                 with self.subTest(mode=mode):
                     exported = Path(temp) / 'exports' / f'{mode}.json'
                     output, run = self.run_training(temp, mode, ['--output_json', str(exported)])

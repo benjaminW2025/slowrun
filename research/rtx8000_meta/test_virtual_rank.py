@@ -4,7 +4,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from virtual_rank import collect_virtual_gradients, select_trial_parameters, _temporary_step, validate_gradients
+from virtual_rank import collect_virtual_gradients, select_trial_parameters, _temporary_step, _temporary_group_step, validate_gradients
 
 
 class FixedScaler:
@@ -191,6 +191,48 @@ class VirtualRankTests(unittest.TestCase):
                                       fail_on_b, FixedScaler(128), 1, 1, .5)
         torch.testing.assert_close(model.trial.weight, original, rtol=0, atol=0)
 
+    def test_independent_groups_match_reference_and_restore(self):
+        # Perturb two interacting matrices separately, compute B once at the
+        # joint trial, then compare every final gradient with an explicit reference.
+        for radii in ((.5, .1), (.5, 0.), (0., 0.)):
+            model = TinyModel()
+            params = list(model.parameters())
+            original = [p.detach().clone() for p in params]
+            expected = [torch.zeros_like(p) for p in params]
+            for start in (0, 2):
+                ga = torch.autograd.grad(model(*self.batches[start]), params)
+                with torch.no_grad():
+                    for p, g, r in zip(params, ga, radii):
+                        if r and g.norm() > 0:
+                            p.sub_(r * g / g.norm())
+                gb = torch.autograd.grad(model(*self.batches[start + 1]), params)
+                for dst, a, b in zip(expected, ga, gb):
+                    dst.add_((a + b) / 4)
+                with torch.no_grad():
+                    for p, w in zip(params, original):
+                        p.copy_(w)
+            batches = iter(self.batches[1:] + [self.batches[0]])
+            collect_virtual_gradients(model, params, params, *self.batches[0],
+                                      lambda: (*next(batches), 1), model, FixedScaler(128),
+                                      2, 1, .5,
+                                      trial_groups=[([p], r) for p, r in zip(params, radii)])
+            for p, w, want in zip(params, original, expected):
+                torch.testing.assert_close(p, w, rtol=0, atol=0)
+                torch.testing.assert_close(p.grad / 128, want)
+
+    def test_group_failure_restores_earlier_group_and_rejects_overlap(self):
+        model = TinyModel()
+        params = list(model.parameters())
+        original = [p.detach().clone() for p in params]
+        params[0].grad = torch.ones_like(params[0])
+        params[1].grad = None
+        with self.assertRaises(RuntimeError):
+            _temporary_group_step(params, [([params[0]], .5), ([params[1]], .1)])
+        for p, w in zip(params, original):
+            torch.testing.assert_close(p, w, rtol=0, atol=0)
+        with self.assertRaises(ValueError):
+            _temporary_group_step(params, [(params, .5), ([params[0]], .1)])
+
     def test_matrix_selection(self):
         weights = {
             name: nn.Parameter(torch.ones(2, 2))
@@ -208,6 +250,7 @@ class VirtualRankTests(unittest.TestCase):
             "v": ["h.0.attn.c_v.weight"],
             "qkv": ["h.0.attn.c_q.weight", "h.0.attn.c_k.weight", "h.0.attn.c_v.weight"],
             "mlp": ["h.0.mlp.c_fc.weight", "h.0.mlp.c_proj.weight"],
+            "mlp_v": ["h.0.attn.c_v.weight", "h.0.mlp.c_fc.weight", "h.0.mlp.c_proj.weight"],
         }.items():
             selected = select_trial_parameters(named, muon_ids, mode)
             self.assertEqual([name for name, p in named if any(p is q for q in selected)], expected)

@@ -4,12 +4,15 @@ The returned parameter gradients equal the mean of independent virtual-rank
 gradients. No optimizer step occurs until every trial has been restored.
 """
 
+import math
+
 import torch
 
 
 TRIAL_PATTERNS = {
     "off": (),
     "mlp": (".mlp.",),
+    "mlp_v": (".mlp.", ".attn.c_v."),
     "qk": (".attn.c_q.", ".attn.c_k."),
     "v": (".attn.c_v.",),
     "qkv": (".attn.c_q.", ".attn.c_k.", ".attn.c_v."),
@@ -67,6 +70,27 @@ def _temporary_step(trial_params, step_norm):
     return original_weights
 
 
+@torch.no_grad()
+def _temporary_group_step(trial_params, groups):
+    """Apply independent group norms atomically; zero-radius groups are untouched."""
+    grouped = [p for params, radius in groups for p in params]
+    if len({id(p) for p in grouped}) != len(grouped):
+        raise ValueError("Temporary-step groups overlap")
+    if {id(p) for p in grouped} != {id(p) for p in trial_params}:
+        raise ValueError("Temporary-step groups must cover exactly the trial parameters")
+    if any(not math.isfinite(radius) or radius < 0 for params, radius in groups):
+        raise ValueError("Group step norms must be nonnegative and finite")
+    original = [p.detach().clone() for p in trial_params]
+    try:
+        for params, radius in groups:
+            if radius > 0:
+                _temporary_step(params, radius)
+    except BaseException:
+        torch._foreach_copy_(trial_params, original)
+        raise
+    return original
+
+
 def collect_virtual_gradients(
     model,
     trainable_params,
@@ -81,6 +105,7 @@ def collect_virtual_gradients(
     step_norm,
     capture_episode=None,
     capture_episodes=None,
+    trial_groups=None,
 ):
     """Run rank-local A/B trials and leave their averaged gradient in p.grad.
 
@@ -118,7 +143,9 @@ def collect_virtual_gradients(
                     scaler.scale(loss).backward()
                     x, y, epoch = next_batch()
                 if half == 0 and trial_params:
-                    original_weights = _temporary_step(trial_params, step_norm)
+                    original_weights = (_temporary_group_step(trial_params, trial_groups)
+                                        if trial_groups is not None else
+                                        _temporary_step(trial_params, step_norm))
         finally:
             if original_weights is not None:
                 with torch.no_grad():
