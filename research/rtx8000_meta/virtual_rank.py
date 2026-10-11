@@ -26,11 +26,34 @@ def select_trial_parameters(named_parameters, muon_parameter_ids, mode):
     return selected
 
 
+def validate_gradients(named_parameters, expected_parameter_ids):
+    """Reject disconnected/nonfinite optimizer gradients before any update.
+
+    A tensor of zeros is allowed (e.g. QKV at initialization). None is not:
+    every optimizer-managed parameter in this model participates in the loss.
+    Parameters deliberately excluded from the optimizer, such as disabled XSA,
+    are not checked.
+    """
+    expected = [(name, p) for name, p in named_parameters if id(p) in expected_parameter_ids]
+    missing = [name for name, p in expected if p.grad is None]
+    if missing:
+        raise RuntimeError("Missing training gradients (disconnected parameters): " + ", ".join(missing))
+    if not expected:
+        raise ValueError("No optimizer parameters to validate")
+    norms = torch.stack(torch._foreach_norm([p.grad for name, p in expected]))
+    valid = torch.isfinite(norms)
+    if not bool(valid.all()):
+        bad = [name for (name, p), ok in zip(expected, valid.tolist()) if not ok]
+        raise FloatingPointError("Nonfinite training gradients: " + ", ".join(bad))
+    return len(expected)
+
+
 @torch.no_grad()
 def _temporary_step(trial_params, step_norm):
     original_weights = [p.detach().clone() for p in trial_params]
-    direction = [p.grad.detach().clone() if p.grad is not None else torch.zeros_like(p)
-                 for p in trial_params]
+    if any(p.grad is None for p in trial_params):
+        raise RuntimeError("Missing temporary A gradients: selected matrices are disconnected from the loss")
+    direction = [p.grad.detach().clone() for p in trial_params]
     norm = torch.linalg.vector_norm(torch.stack(torch._foreach_norm(direction)))
     if not bool(torch.isfinite(norm)):
         raise FloatingPointError(f"Invalid temporary A-gradient norm: {norm.item()}")

@@ -56,6 +56,26 @@ can still be profiled with the fix, but the fix cannot repair their past updates
 CPU regressions cover both `.backward()` and the profiler's `autograd.grad`;
 actual CUDA FP16 execution still needs a GPU smoke test.
 
+## Additional training-path audit — 2026-10-10
+
+- Every optimizer update now checks all optimizer-managed tensors for missing or
+  nonfinite gradients before changing parameters. Disabled XSA parameters are
+  explicitly outside that set. Tensor-valued zero gradients remain allowed;
+  disconnected (`None`) gradients do not. The normalized A trial also rejects
+  missing gradients, rather than substituting zeros.
+- Added complete-script CPU fixtures for all four modes across a one-pass to
+  two-pass transition, including loader consumption, schedules, EMA, exported
+  metrics and saved finite weights. Fixtures reduce sequence length and vocabulary
+  and disable compilation; they execute the actual training loop. A standalone
+  two-pair, three-group profiling fixture verifies no optimizer update/model save.
+- Added CPU FP16 tests with half-precision rotary buffers and a real GradScaler
+  for all four modes across one- and two-pass updates. These complement the
+  BF16 cache regression; they do not establish CUDA kernel correctness.
+- A B-forward exception must restore temporarily perturbed A weights exactly.
+- Fixed two reporting defects: `--save-result`/`--output_json` previously had no
+  effect, and checkpoint averaging selected the best metric by loss rather than
+  BPB, unlike the other evaluations. These changes do not change training updates.
+
 ## Intentional differences and remaining limits
 
 - RTX path uses FP16 autocast, FP32 parameters/optimizer state, FP32 Muon polar iteration, and FP16 rotary buffers. Original uses BF16 and stores embeddings in BF16. Equality tests at common precision do not establish equality across these actual precision regimes. RMS normalization's default epsilon also depends on input dtype.

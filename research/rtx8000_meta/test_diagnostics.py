@@ -16,7 +16,7 @@ import torch
 from diagnostics import probe_episode, preview_muon
 from test_upstream_audit import load, LocalOnly
 from test_virtual_rank import FixedScaler
-from virtual_rank import collect_virtual_gradients, select_trial_parameters
+from virtual_rank import collect_virtual_gradients, select_trial_parameters, validate_gradients
 
 
 def assert_tree(test, actual, expected):
@@ -100,6 +100,43 @@ class DiagnosticsTests(unittest.TestCase):
             selected = select_trial_parameters(self.model.named_parameters(), ids, mode)
             self.assertTrue(all(p.grad is not None for p in selected))
             self.assertGreater(sum(float(p.grad.norm()) for p in selected), 0)
+
+    def test_cpu_fp16_scaler_all_arms_one_and_two_pass_updates(self):
+        # Actual FP16 casts, half rotary buffers and GradScaler, on CPU. This
+        # exercises precision/scale semantics but does not validate CUDA kernels.
+        for mode in ('off', 'qk', 'v', 'mlp'):
+            with self.subTest(mode=mode):
+                ns = load(ast.parse(Path(__file__).with_name('train.py').read_text()), LocalOnly())
+                ns['ACTIVATION_DTYPE'] = torch.float16
+                torch.manual_seed(42)
+                model = ns['GPT'](ns['GPTConfig'](vocab_size=64, dropout=0., xsa_mode='off'))
+                model.init_weights()
+                optimizer = model.setup_optimizer()
+                params = list(model.parameters())
+                ids = {id(p) for group in optimizer.param_groups for p in group['params']}
+                muon_ids = {id(p) for group in optimizer.param_groups if group['kind'] == 'muon' for p in group['params']}
+                trial = select_trial_parameters(model.named_parameters(), muon_ids, mode)
+                scaler = torch.amp.GradScaler('cpu', init_scale=128)
+                for iterations in (1, 2, 2):
+                    def forward(x, y):
+                        with torch.autocast('cpu', dtype=torch.float16, cache_enabled=False):
+                            return model(x, y, num_iterations=iterations)
+                    batch_iter = iter(self.batches[1:] + [self.batches[0]])
+                    loss, *_ = collect_virtual_gradients(
+                        model, params, trial, *self.batches[0], lambda: (*next(batch_iter), 1),
+                        forward, scaler, 2, 1, .5)
+                    scaler.unscale_(optimizer)
+                    self.assertTrue(bool(torch.isfinite(loss)))
+                    validate_gradients(model.named_parameters(), ids)
+                    if iterations == 2:
+                        for selected_mode in ('qk', 'v', 'mlp'):
+                            selected = select_trial_parameters(model.named_parameters(), muon_ids, selected_mode)
+                            self.assertGreater(sum(float(p.grad.norm()) for p in selected), 0)
+                    previous_scale = scaler.get_scale()
+                    scaler.step(optimizer); scaler.update()
+                    self.assertEqual(previous_scale, scaler.get_scale())
+                    self.assertTrue(all(bool(torch.isfinite(p).all()) for p in params))
+                    model.zero_grad(set_to_none=True)
 
     def test_probe_preserves_training_state_and_next_update(self):
         before = self.snapshot()

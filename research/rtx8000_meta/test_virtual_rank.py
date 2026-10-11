@@ -4,7 +4,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from virtual_rank import collect_virtual_gradients, select_trial_parameters, _temporary_step
+from virtual_rank import collect_virtual_gradients, select_trial_parameters, _temporary_step, validate_gradients
 
 
 class FixedScaler:
@@ -156,6 +156,40 @@ class VirtualRankTests(unittest.TestCase):
             torch.testing.assert_close(actual, expected, rtol=0.01, atol=0)
         finally:
             torch.set_num_threads(old_threads)
+
+    def test_gradient_guard_distinguishes_zero_missing_and_nonfinite(self):
+        model = TinyModel()
+        named = list(model.named_parameters())
+        ids = {id(p) for name, p in named}
+        with self.assertRaisesRegex(RuntimeError, 'Missing training gradients'):
+            validate_gradients(named, ids)
+        with self.assertRaisesRegex(RuntimeError, 'Missing temporary A gradients'):
+            _temporary_step([model.trial.weight], .5)
+        for name, p in named: p.grad = torch.zeros_like(p)
+        self.assertEqual(validate_gradients(named, ids), 2)
+        for value in (float('nan'), float('inf')):
+            model.trial.weight.grad.fill_(value)
+            with self.assertRaisesRegex(FloatingPointError, 'trial.weight'):
+                validate_gradients(named, ids)
+        # An intentionally unused parameter outside the optimizer is permitted.
+        model.register_parameter('disabled', nn.Parameter(torch.ones(1)))
+        model.trial.weight.grad.zero_()
+        self.assertEqual(validate_gradients(model.named_parameters(), ids), 2)
+
+    def test_b_failure_restores_temporary_weights(self):
+        model = TinyModel()
+        original = model.trial.weight.detach().clone()
+        calls = 0
+        def fail_on_b(x, y):
+            nonlocal calls
+            calls += 1
+            if calls == 2: raise RuntimeError('failed B forward')
+            return model(x, y)
+        with self.assertRaisesRegex(RuntimeError, 'failed B forward'):
+            collect_virtual_gradients(model, list(model.parameters()), [model.trial.weight],
+                                      *self.batches[0], lambda: (*self.batches[1], 1),
+                                      fail_on_b, FixedScaler(128), 1, 1, .5)
+        torch.testing.assert_close(model.trial.weight, original, rtol=0, atol=0)
 
     def test_matrix_selection(self):
         weights = {

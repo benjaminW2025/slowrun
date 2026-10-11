@@ -28,7 +28,7 @@ import wandb
 import numpy as np
 
 import tiktoken
-from virtual_rank import collect_virtual_gradients, select_trial_parameters
+from virtual_rank import collect_virtual_gradients, select_trial_parameters, validate_gradients
 from diagnostics import probe_episode
 
 _script_start = time.time()
@@ -1280,6 +1280,7 @@ trial_params = select_trial_parameters(orig_model.named_parameters(), muon_ids, 
 print0(f"Temporary-step matrices: {args.mg_mode}: {len(trial_params)} tensors, "
        f"{sum(p.numel() for p in trial_params):,} parameters")
 trainable_params = [p for p in orig_model.parameters() if p.requires_grad]
+optimizer_parameter_ids = {id(p) for group in optimizer.param_groups for p in group["params"]}
 
 # Dataloaders
 _train_path = args.input_bin if args.input_bin else os.path.join(DATA_DIR, "fineweb_train.pt")
@@ -1519,6 +1520,12 @@ while current_epoch <= args.num_epochs:
             sys.stdout.flush(); sys.stderr.flush()
             raise SystemExit(0)
     scaler.unscale_(optimizer)
+    if not math.isfinite(float(train_loss)):
+        raise FloatingPointError("Nonfinite training loss; refusing to update parameters")
+    checked_parameters = validate_gradients(orig_model.named_parameters(), optimizer_parameter_ids)
+    if step == 0 or step % 50 == 0:
+        print0(f"Gradient check: {checked_parameters} optimizer tensors connected and finite "
+               f"| train iters: {active_num_iterations}")
     scale_before_step = scaler.get_scale()
     scaler.step(optimizer)
     scaler.update()
@@ -1690,7 +1697,7 @@ if len(late_ckpt_paths) >= 2:
     wandb_run.log({"ckpt_avg/bpb": avg_bpb, "ckpt_avg/loss": avg_loss, "ckpt_avg/num_iterations": NUM_ITERATIONS})
     val_bpb, val_loss = avg_bpb, avg_loss
     model_variant = "checkpoint_average"
-    if avg_loss < min_val_loss:
+    if avg_bpb < min_val_bpb:
         min_val_loss, min_val_bpb = avg_loss, avg_bpb
 
 # Summary
@@ -1748,6 +1755,11 @@ if master_process:
     with open(result_path, "w") as f:
         json.dump(result, f, indent=2)
     print0(f"Result saved to {result_path}")
+    if args.save_result and os.path.abspath(args.save_result) != os.path.abspath(result_path):
+        os.makedirs(os.path.dirname(os.path.abspath(args.save_result)), exist_ok=True)
+        with open(args.save_result, "w") as f:
+            json.dump(result, f, indent=2)
+        print0(f"Result also saved to {args.save_result}")
 
 # Save final model
 if master_process:
