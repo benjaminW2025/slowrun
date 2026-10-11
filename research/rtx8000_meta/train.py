@@ -49,14 +49,14 @@ parser.add_argument("--no-compile", action="store_true",
                     help="Disable model torch.compile for a quick correctness smoke test.")
 parser.add_argument("--virtual-ranks", type=int, default=8,
                     help="Sequentially simulate this many independent rank-local A/B episodes per optimizer step.")
-parser.add_argument("--mg-mode", choices=("off", "mlp", "qk", "v"), default="off",
+parser.add_argument("--mg-mode", choices=("off", "mlp", "qk", "v", "qkv"), default="off",
                     help="Matrices receiving the temporary A-gradient step; off is the paired baseline.")
 parser.add_argument("--mg-step-norm", type=float, default=0.5,
                     help="Euclidean norm of each rank-local temporary step, as in Tiny PR #99.")
 parser.add_argument("--probe-every", type=int, default=0,
                     help="Read-only probes before update 1 and every N updates thereafter; 0 disables.")
 parser.add_argument("--probe-modes", type=str, default="qk,v,mlp",
-                    help="Comma-separated matrix groups to probe: mlp,qk,v.")
+                    help="Comma-separated matrix groups to probe: mlp,qk,v,qkv.")
 parser.add_argument("--probe-pairs", type=int, default=1,
                     help="Probe this many virtual-rank A/B episodes using the same pairs for every matrix group.")
 parser.add_argument("--probe-pair-offset", type=int, default=0,
@@ -160,7 +160,7 @@ if not math.isfinite(args.probe_transfer_radius) or args.probe_transfer_radius <
     raise ValueError("--probe-transfer-radius must be positive and finite")
 probe_modes = tuple(args.probe_modes.split(","))
 probe_radii = tuple(float(x) for x in args.probe_radii.split(","))
-if args.probe_every < 0 or not probe_modes or any(m not in {"mlp", "qk", "v"} for m in probe_modes):
+if args.probe_every < 0 or not probe_modes or any(m not in {"mlp", "qk", "v", "qkv"} for m in probe_modes):
     raise ValueError("Invalid --probe-every or --probe-modes")
 if not probe_radii or any(not math.isfinite(r) or r <= 0 for r in probe_radii):
     raise ValueError("--probe-radii must contain positive finite numbers")

@@ -71,7 +71,7 @@ class FullTrainingTests(unittest.TestCase):
 
     def test_all_arms_cross_recurrence_transition_and_save_finite_models(self):
         with tempfile.TemporaryDirectory() as temp:
-            for mode in ('off', 'qk', 'v', 'mlp'):
+            for mode in ('off', 'qk', 'v', 'qkv', 'mlp'):
                 with self.subTest(mode=mode):
                     exported = Path(temp) / 'exports' / f'{mode}.json'
                     output, run = self.run_training(temp, mode, ['--output_json', str(exported)])
@@ -112,7 +112,7 @@ class FullTrainingTests(unittest.TestCase):
             output, run = self.run_training(temp, 'off', [
                 '--iteration-schedule', 'constant', '--probe-every', '1',
                 '--probe-pairs', '2', '--probe-pair-offset', '1',
-                '--probe-modes', 'qk,v,mlp', '--probe-radii', '.1,.5',
+                '--probe-modes', 'qk,v,qkv,mlp', '--probe-radii', '.1,.5',
                 '--probe-alignment-only', '--probe-only', '--probe-muon-bprime', '--probe-abc'])
             self.assertIn('Muon cos(A,Bprime)', output)
             self.assertIn('C paired/muon', output)
@@ -122,7 +122,7 @@ class FullTrainingTests(unittest.TestCase):
             self.assertEqual(event['optimizer_state'], 'fresh')
             self.assertEqual(event['c_source'], 'validation')
             self.assertTrue(event['c_path'].endswith('validation.pt'))
-            self.assertEqual(len(event['measurements']), 6)
+            self.assertEqual(len(event['measurements']), 8)
             self.assertEqual([e['c_start_batch'] for e in event['episodes']], [1, 2])
             for m in event['measurements']:
                 self.assertEqual(len(m['transfer_baselines']), 12)

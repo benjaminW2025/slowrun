@@ -222,3 +222,35 @@ the aggregate summaries and output path. Once the one-pair runtime/memory is kno
 replace the final `1` with `8` to reproduce the original eight-pair sampling budget.
 Each A, B and C half still has 16 sequences with these batch settings. On a shared
 GPU node, use the device assigned to your session in the GPU argument.
+
+
+### Joint QKV and larger A/B/C samples
+
+`--mg-mode qkv` perturbs Q, K, and V projection matrices jointly, using one
+normalized A-gradient direction with the requested **total** step norm across
+all selected matrices. It does not include attention output projections, and
+it does not change Muon/Adam parameter groups or stop any other weights training.
+The profile supports the same `qkv` group alongside `qk`, `v`, and `mlp`.
+
+The launcher now defaults to eight pairs and all four groups. First replicate
+at the existing radii, then sweep temporary A-step radii on those same pairs:
+
+```bash
+bash research/rtx8000_meta/run_profile.sh abc 0 8
+PROBE_RADII=0.025,0.05,0.1,0.25,0.5 bash research/rtx8000_meta/run_profile.sh abc 0 8
+```
+
+Confirm any promising setting on a different data block:
+
+```bash
+PROBE_PAIR_OFFSET=8 PROBE_RADII=0.025,0.05,0.1,0.25,0.5 bash research/rtx8000_meta/run_profile.sh abc 0 8
+```
+
+Environment overrides: `PROBE_MODES` (default `qk,v,qkv,mlp`), `PROBE_RADII`
+(default `0.1,0.5`), `PROBE_PAIR_OFFSET` (default `0`), and
+`PROBE_TRANSFER_RADIUS` (default `0.1`). These are distinct knobs: `PROBE_RADII`
+sets temporary A adaptation, while `PROBE_TRANSFER_RADIUS` sets the candidate
+update norm for C evaluation. Zero A adaptation is already represented by the
+ordinary paired baseline, so it does not require a zero-radius trial. Checkpoint
+profiles still start with fresh optimizer state. These runs measure transfer;
+they are not training runs and do not establish a long-run improvement.

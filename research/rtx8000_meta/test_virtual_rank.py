@@ -206,6 +206,7 @@ class VirtualRankTests(unittest.TestCase):
             "off": [],
             "qk": ["h.0.attn.c_q.weight", "h.0.attn.c_k.weight"],
             "v": ["h.0.attn.c_v.weight"],
+            "qkv": ["h.0.attn.c_q.weight", "h.0.attn.c_k.weight", "h.0.attn.c_v.weight"],
             "mlp": ["h.0.mlp.c_fc.weight", "h.0.mlp.c_proj.weight"],
         }.items():
             selected = select_trial_parameters(named, muon_ids, mode)

@@ -12,6 +12,7 @@ TRIAL_PATTERNS = {
     "mlp": (".mlp.",),
     "qk": (".attn.c_q.", ".attn.c_k."),
     "v": (".attn.c_v.",),
+    "qkv": (".attn.c_q.", ".attn.c_k.", ".attn.c_v."),
 }
 
 
