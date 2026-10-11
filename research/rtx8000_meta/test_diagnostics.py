@@ -61,6 +61,46 @@ class DiagnosticsTests(unittest.TestCase):
         after = self.snapshot()
         for a, b in zip(after, before): assert_tree(self, a, b)
 
+    def test_recurrent_autocast_keeps_all_selected_matrix_gradients(self):
+        # Use the cache setting from the production context, with CPU BF16 for
+        # this portable regression. CUDA FP16 still requires a GPU smoke test.
+        tree = ast.parse(Path(__file__).with_name('train.py').read_text())
+        assignment = next(n for n in tree.body if isinstance(n, ast.Assign)
+                          and any(isinstance(t, ast.Name) and t.id == 'autocast_ctx' for t in n.targets))
+        call = assignment.value.body
+        cache = next(k.value.value for k in call.keywords if k.arg == 'cache_enabled')
+        self.assertFalse(cache)
+        for mode in ('qk', 'v', 'mlp'):
+            def forward(x, y):
+                with torch.autocast('cpu', dtype=torch.bfloat16, cache_enabled=cache):
+                    return self.model(x, y, num_iterations=2)
+            records = probe_episode(self.model, self.optimizer, self.model.named_parameters(),
+                                    *self.capture, forward, self.ns['muon_step_fused'], 128,
+                                    modes=(mode,), radii=(.1,), alignment_only=True)
+            self.assertGreater(records[0]['gradient_a_norm'], 0)
+            self.assertGreater(records[0]['gradient_b_norm'], 0)
+            self.assertGreater(records[0]['trials'][0]['b_prime_norm'], 0)
+            # The same production recurrence silently lost ALL these gradients
+            # with the old cached context; now diagnostics must reject it.
+            def broken_forward(x, y):
+                with torch.autocast('cpu', dtype=torch.bfloat16, cache_enabled=True):
+                    return self.model(x, y, num_iterations=2)
+            with self.assertRaisesRegex(RuntimeError, 'disconnected'):
+                probe_episode(self.model, self.optimizer, self.model.named_parameters(),
+                              *self.capture, broken_forward, self.ns['muon_step_fused'], 128,
+                              modes=(mode,), radii=(.1,), alignment_only=True)
+
+    def test_recurrent_autocast_training_backpropagates_to_matrices(self):
+        self.model.zero_grad(set_to_none=True)
+        with torch.autocast('cpu', dtype=torch.bfloat16, cache_enabled=False):
+            loss = self.model(*self.batches[0], num_iterations=2)
+        (loss * 128).backward()
+        ids = {id(p) for g in self.optimizer.param_groups if g['kind'] == 'muon' for p in g['params']}
+        for mode in ('qk', 'v', 'mlp'):
+            selected = select_trial_parameters(self.model.named_parameters(), ids, mode)
+            self.assertTrue(all(p.grad is not None for p in selected))
+            self.assertGreater(sum(float(p.grad.norm()) for p in selected), 0)
+
     def test_probe_preserves_training_state_and_next_update(self):
         before = self.snapshot()
         records = probe_episode(self.model, self.optimizer, self.model.named_parameters(),

@@ -1128,7 +1128,9 @@ else:
 device_type = device.type
 print0(f"Compute device: {device}" + (f" | {torch.cuda.get_device_name(device)}" if cuda_available else " | explicit FP32 CPU reference"))
 autocast_ctx = (
-    torch.amp.autocast(device_type="cuda", dtype=torch.float16)
+    # A no-grad recurrent pass must not cache detached casts for the next,
+    # differentiable pass through the same weights. Applies to training and probes.
+    torch.amp.autocast(device_type="cuda", dtype=torch.float16, cache_enabled=False)
     if device_type == "cuda" and args.precision == "fp16" else nullcontext()
 )
 scaler = torch.amp.GradScaler(

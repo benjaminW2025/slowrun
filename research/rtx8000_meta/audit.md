@@ -34,6 +34,28 @@ MLP selection includes gate, expansion and output matrices. QK selects query and
 - **Short-run checkpoint eligibility:** under a compressed 500-step schedule, averaging previously included a checkpoint around step 190 even though SWA started near 367. Collect averaging checkpoints only inside the scheduled SWA window. A short run with fewer than two eligible checkpoints skips checkpoint averaging.
 - Earlier process-group and zero-initialized QKV-gradient fixes remain covered by tests.
 
+## Recurrent mixed-precision correction — 2026-10-10
+
+The outer autocast context previously cached FP16 weight casts created during
+an early recurrent pass under `no_grad`. Reusing those detached casts in the
+subsequent differentiable pass disconnected QK, V and MLP matrices from the
+loss. The profiler silently replaced `None` gradients with zeros. A small
+version of the actual model reproduces missing gradients for every selected
+matrix with CPU BF16 autocast; disabling the cache restores nonzero A, B and
+adapted-B gradients. Production CUDA FP16 autocast now sets
+`cache_enabled=False` for both training and profiling. Diagnostics reject
+missing gradients instead of reporting them as zeros. Legitimate tensor-valued
+zero gradients at initialization remain permitted.
+
+This affects mixed-precision training whenever recurrence uses a no-grad pass
+followed by a differentiable pass (e.g. the last 150 steps of the default
+500-step, 1x-to-2x schedule). Earlier single-pass updates are unaffected by this
+specific bug. The old 500-step arm scores must be rerun before interpreting
+them as evidence about correctly trained two-pass models. Existing checkpoints
+can still be profiled with the fix, but the fix cannot repair their past updates.
+CPU regressions cover both `.backward()` and the profiler's `autograd.grad`;
+actual CUDA FP16 execution still needs a GPU smoke test.
+
 ## Intentional differences and remaining limits
 
 - RTX path uses FP16 autocast, FP32 parameters/optimizer state, FP32 Muon polar iteration, and FP16 rotary buffers. Original uses BF16 and stores embeddings in BF16. Equality tests at common precision do not establish equality across these actual precision regimes. RMS normalization's default epsilon also depends on input dtype.

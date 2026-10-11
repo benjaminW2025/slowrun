@@ -61,8 +61,14 @@ def _gradients(forward_loss, batches, params, scale):
         loss_sum += float(loss.detach())
         # Avoid the same FP16 loss-predivision underflow as the training path.
         grads = torch.autograd.grad(loss * scale, params, allow_unused=True)
+        if any(grad is None for grad in grads):
+            raise RuntimeError(
+                "Selected probe matrices are disconnected from the loss graph. "
+                "Missing gradients are not zero gradients; check autocast caching "
+                "across no-grad recurrent passes."
+            )
         for out, grad in zip(total, grads):
-            if grad is not None: out.add_(grad.detach())
+            out.add_(grad.detach())
     for out in total: out.div_(len(batches) * scale)
     if not all(bool(torch.isfinite(g).all()) for g in total):
         raise FloatingPointError('Nonfinite diagnostic gradient')
