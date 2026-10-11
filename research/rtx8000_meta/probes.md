@@ -98,3 +98,127 @@ python research/rtx8000_meta/summarize_probes.py runs/probe-mlp-500/probes.jsonl
 ```
 
 To compare training trajectories, repeat the same diagnostic command with `--mg-mode off` and a fresh run name. Existing runs started without diagnostics continue unchanged and cannot emit these probes retroactively.
+
+## Muon B-prime and A/B/C transfer (schema 3)
+
+`--probe-muon-bprime` extends the raw alignment profile. It requires
+`--probe-alignment-only --probe-every N`. The flag name means the old native
+A/decay scenarios are skipped; the explicitly requested Muon B-prime comparisons
+still run. Standalone `--probe-only` works without a preliminary training backward.
+Online probes use the current optimizer buffers. All previews use private copies
+of the same buffers and never commit a candidate step.
+
+For each selected group and A radius, record:
+
+- `cosine_muon_a_b_prime`: native Muon descent directions from A and B-prime.
+- `cosine_raw_a_muon_b_prime`: raw A gradient versus the negative Muon B-prime
+  displacement (a gradient-like direction, including per-shape LR factors).
+- `cosine_muon_b_b_prime`, `relative_muon_b_change`, and
+  `cosine_muon_a_correction`: what survives or changes through Muon.
+- `cosine_muon_paired_meta`, `relative_muon_paired_meta_change`: Muon applied
+  directly to `(A+B)/2` versus directly to `(A+Bprime)/2`. Muon is nonlinear;
+  averaging individually transformed A/B directions is not this computation.
+- Native B-prime displacement norm and its ratio to B's. Metrics are also stored
+  per matrix; these refer to a joint group perturbation, not independent matrix trials.
+
+The transformed correction compares `Muon(Bprime) - Muon(B)`, not
+`Muon(Bprime - B)`. The separate C correction trial transforms `(Bprime-B)/2`
+on its own. Neither substitutes for comparing the complete paired and meta
+updates, because the transform is nonlinear.
+
+B-prime is computed at the temporarily perturbed weights. Original weights are
+restored BEFORE any candidate optimizer preview or C displacement. Every candidate
+starts at original theta. Muon previews include momentum, Polar Express, variance
+adjustment and shape-dependent LR. Weight decay is excluded to isolate the gradient
+transformation.
+
+`--init-model` loads weights only. Schema 3 records `optimizer_state=fresh` when
+there is no history, or `live` for online state. A checkpoint profile with fresh
+state is not a reconstruction of that checkpoint's original optimizer update.
+Use online probes in a corrected training run to inspect real accumulated history.
+
+`--probe-abc` additionally reads C from a separate validation loader. It uses the
+same number of sequences as each A/B half. C neither enters candidate construction
+nor advances the training loader; all groups/candidates reuse the same C examples.
+C's gradient is used only to report directional alignment and a linearized loss
+change. A and B remain training examples. The same input file for training/C is
+rejected, but separate filenames alone cannot prove corpus-level deduplication.
+
+At original theta, compare raw descent and Muon descent from:
+
+1. A alone; B alone; their arithmetic mean (`paired`).
+2. `agreement`: per coordinate, keep the shared sign with the smaller absolute
+   gradient magnitude; otherwise zero. This is an explicit, basis-dependent
+   heuristic, not a unique shared component or the AND-mask algorithm.
+3. `remainder = paired - agreement`. Together they reconstruct the paired gradient.
+4. `zero_input`: control for the effect of optimizer history without a current
+   gradient. Fresh-state Muon gives a no-op; live momentum can give a nonzero step.
+5. For each A adaptation radius: B-prime alone (`adapted_b`), the meta-gradient
+   `(A+Bprime)/2` (`meta`), and `(Bprime-B)/2` alone (`meta_correction`).
+
+Every C trial has the same group-wide Euclidean displacement norm, set separately
+by `--probe-transfer-radius` (default 0.1). This is independent of `--probe-radii`,
+which sets the temporary A perturbation. Zero directions are recorded as no-ops.
+A normalized correction-only trial is a direction test: it does not represent its
+actual fractional contribution to the production update. These are restricted
+selected-group interventions using one A/B pair's gradient, not full-model or
+full-global-batch optimizer steps.
+
+Record `c_loss_change` (negative improves C), `cosine_c_displacement` (negative is
+locally favorable), input gradient norm, native displacement norm, applied norm,
+linearized loss change and residual. With truncated recurrent backprop, gradient
+projections are not exact derivatives of the full recurrent forward objective;
+actual C-loss changes are the primary endpoint. Repeatedly selecting hypotheses
+using C turns it into development data; confirm a chosen intervention separately.
+
+Start with one pair to measure runtime/memory before requesting eight. Use a fresh
+run name; `probes.jsonl` appends, so reusing names can mix old and corrected events.
+Extended summaries keep each appended event separate.
+
+```bash
+# First: Muon B-prime only, on the same existing checkpoint.
+CUDA_VISIBLE_DEVICES=0 WANDB_MODE=disabled python research/rtx8000_meta/train.py \
+  --init-model runs/audit-v-500/model.pt \
+  --mg-mode off --precision fp16 --loss-scale 128 --no-compile \
+  --device-batch-size 1 --virtual-ranks 8 --total-batch-size 524288 \
+  --schedule-steps 500 --max-train-steps 1 --eval-tokens 32768 \
+  --iteration-schedule constant --num-iterations 2 --seed 42 \
+  --probe-every 1 --probe-pairs 1 --probe-modes qk,v,mlp \
+  --probe-radii 0.1,0.5 --probe-alignment-only --probe-muon-bprime --probe-only \
+  --run-name muon-bprime-v-one-pair
+
+# Then: same settings, adding --probe-abc --probe-transfer-radius 0.1
+# and changing --run-name to abc-v-one-pair.
+
+python research/rtx8000_meta/summarize_probes.py \
+  runs/muon-bprime-v-one-pair/probes.jsonl --muon-bprime --aggregate
+python research/rtx8000_meta/summarize_probes.py \
+  runs/abc-v-one-pair/probes.jsonl --transfer --aggregate
+```
+
+The transfer summary includes `vs_paired_c_change`, a paired comparison against
+the ordinary A/B mean with the same transform, C examples and displacement norm.
+Negative means the candidate beat the ordinary paired update on C. It also reports
+sample standard deviations and C-hurt counts. This does not establish statistical
+significance or long-run generalization. For more pairs, raise `--probe-pairs` to 8.
+For another block, use `--probe-pair-offset 8` and a fresh run name; both A/B and C
+offsets advance consistently. Online C batches advance across probe events and
+may eventually wrap the validation loader; the starting epoch/batch is recorded.
+
+### Short launch commands
+
+From the cluster repo, pull the branch and run:
+
+```bash
+git pull --ff-only
+bash research/rtx8000_meta/run_profile.sh muon 0 1
+bash research/rtx8000_meta/run_profile.sh abc 0 1
+```
+
+Arguments are profile kind, visible GPU index, pair count, and optionally checkpoint
+path. Defaults use `runs/audit-v-500/model.pt`. The launcher uses `.venv/bin/python`
+when present, generates a unique run name, performs no optimizer update, and prints
+the aggregate summaries and output path. Once the one-pair runtime/memory is known,
+replace the final `1` with `8` to reproduce the original eight-pair sampling budget.
+Each A, B and C half still has 16 sequences with these batch settings. On a shared
+GPU node, use the device assigned to your session in the GPU argument.

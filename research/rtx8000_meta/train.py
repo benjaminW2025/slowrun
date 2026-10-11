@@ -30,6 +30,7 @@ import numpy as np
 import tiktoken
 from virtual_rank import collect_virtual_gradients, select_trial_parameters, validate_gradients
 from diagnostics import probe_episode
+from transfer import probe_transfer_episode
 
 _script_start = time.time()
 
@@ -62,6 +63,12 @@ parser.add_argument("--probe-pair-offset", type=int, default=0,
                     help="Skip this many A/B pairs in standalone alignment profiling to sample another data block.")
 parser.add_argument("--probe-alignment-only", action="store_true",
                     help="Measure raw A/B gradient interaction without the additional Muon/decay trials.")
+parser.add_argument("--probe-muon-bprime", action="store_true",
+                    help="Compare Muon(A), Muon(B), Muon(Bprime), and Muon of paired/meta averages.")
+parser.add_argument("--probe-abc", action="store_true",
+                    help="Score A/B-derived raw and Muon directions on separate validation C samples.")
+parser.add_argument("--probe-transfer-radius", type=float, default=0.1,
+                    help="Matched group-wide displacement norm on C, independent of the A adaptation radius.")
 parser.add_argument("--probe-only", action="store_true",
                     help="Write one diagnostic event and exit without applying an optimizer update.")
 parser.add_argument("--init-model", type=str, default=None,
@@ -147,6 +154,10 @@ if args.probe_pair_offset < 0 or (args.probe_pair_offset > 0 and not (args.probe
     raise ValueError("--probe-pair-offset must be nonnegative and requires standalone alignment profiling")
 if args.probe_only and args.probe_every <= 0:
     raise ValueError("--probe-only requires --probe-every > 0")
+if (args.probe_muon_bprime or args.probe_abc) and (not args.probe_alignment_only or args.probe_every <= 0):
+    raise ValueError("Extended probes require --probe-alignment-only and --probe-every > 0")
+if not math.isfinite(args.probe_transfer_radius) or args.probe_transfer_radius <= 0:
+    raise ValueError("--probe-transfer-radius must be positive and finite")
 probe_modes = tuple(args.probe_modes.split(","))
 probe_radii = tuple(float(x) for x in args.probe_radii.split(","))
 if args.probe_every < 0 or not probe_modes or any(m not in {"mlp", "qk", "v"} for m in probe_modes):
@@ -1173,7 +1184,7 @@ if master_process:
     os.makedirs(checkpoints_dir, exist_ok=True)
     os.makedirs(os.path.join(run_dir, "wandb"), exist_ok=True)
     shutil.copy2(__file__, os.path.join(run_dir, "train.py"))
-    for helper in ("virtual_rank.py", "diagnostics.py"):
+    for helper in ("virtual_rank.py", "diagnostics.py", "transfer.py"):
         shutil.copy2(os.path.join(os.path.dirname(__file__), helper), os.path.join(run_dir, helper))
 if dist.is_initialized():
     dist.barrier()
@@ -1287,6 +1298,10 @@ _train_path = args.input_bin if args.input_bin else os.path.join(DATA_DIR, "fine
 _val_path = args.input_val_bin if args.input_val_bin else os.path.join(DATA_DIR, "fineweb_val.pt")
 train_loader = DataLoader(_train_path, args.device_batch_size, MAX_SEQ_LEN, device=device, doc_shuffle=not args.no_doc_shuffle)
 build_val_loader = lambda: DataLoader(_val_path, args.device_batch_size, MAX_SEQ_LEN, device=device)
+if args.probe_abc and os.path.realpath(_train_path) == os.path.realpath(_val_path):
+    raise ValueError("A/B/C profiling requires a separate validation file for C")
+# C has an independent validation loader; fetching it never consumes training data.
+c_probe_loader = build_val_loader() if args.probe_abc else None
 TOKENS_PER_EPOCH = train_loader.total_tokens
 x, y, current_epoch = next(train_loader)
 
@@ -1299,6 +1314,11 @@ if ddp_world_size != 1:
 if grad_accum_steps % (2 * args.virtual_ranks):
     raise ValueError("The global batch must provide equal A and B microbatches for every virtual rank")
 microsteps_per_half = grad_accum_steps // (2 * args.virtual_ranks)
+if c_probe_loader is not None:
+    c_skip = args.probe_pair_offset * microsteps_per_half
+    if c_skip + args.probe_pairs * microsteps_per_half > c_probe_loader.num_steps:
+        raise ValueError("C offset/pairs exceed one validation epoch; choose fewer pairs or a smaller offset")
+    for _ in range(c_skip): next(c_probe_loader)
 num_train_steps = args.schedule_steps or round(TOKENS_PER_EPOCH * args.num_epochs / TOTAL_BATCH_SIZE)
 target_iterations = args.max_train_steps if args.max_train_steps > 0 else num_train_steps
 steps_per_epoch = num_train_steps / args.num_epochs
@@ -1476,28 +1496,54 @@ while current_epoch <= args.num_epochs:
                 return orig_model(batch_x, batch_y, num_iterations=active_num_iterations)
         measurements = []
         episodes = []
+        extended_probe = args.probe_muon_bprime or args.probe_abc
+        optimizer_state_label = "live" if optimizer.state else "fresh"
+
         for pair_index, (a_batches, b_batches) in enumerate(capture_episodes, start=args.probe_pair_offset):
-            pair_measurements = probe_episode(
-                orig_model, optimizer, orig_model.named_parameters(), a_batches, b_batches,
-                probe_forward_loss, probe_muon, scaler.get_scale(), modes=probe_modes, radii=probe_radii,
-                alignment_only=args.probe_alignment_only,
-            )
+            c_batches = None
+            if args.probe_abc:
+                c_batches = []
+                c_start_epoch, c_start_position = c_probe_loader.epoch, c_probe_loader.pos
+                for _ in range(microsteps_per_half):
+                    cx, cy, _ = next(c_probe_loader)
+                    c_batches.append((cx.detach(), cy.detach()))
+            if extended_probe:
+                pair_measurements = probe_transfer_episode(
+                    orig_model, optimizer, orig_model.named_parameters(), a_batches, b_batches,
+                    probe_forward_loss, probe_muon, scaler.get_scale(), modes=probe_modes, radii=probe_radii,
+                    c_batches=c_batches, transfer_radius=args.probe_transfer_radius,
+                )
+            else:
+                pair_measurements = probe_episode(
+                    orig_model, optimizer, orig_model.named_parameters(), a_batches, b_batches,
+                    probe_forward_loss, probe_muon, scaler.get_scale(), modes=probe_modes, radii=probe_radii,
+                    alignment_only=args.probe_alignment_only,
+                )
             for measurement in pair_measurements: measurement["pair_index"] = pair_index
             measurements.extend(pair_measurements)
             episodes.append(dict(pair_index=pair_index, sequences_a=sum(a.size(0) for a, b in a_batches),
                                  sequences_b=sum(a.size(0) for a, b in b_batches),
                                  tokens_a=sum(a.numel() for a, b in a_batches),
                                  tokens_b=sum(a.numel() for a, b in b_batches)))
+            if c_batches is not None:
+                episodes[-1].update(sequences_c=sum(a.size(0) for a, b in c_batches),
+                                    tokens_c=sum(a.numel() for a, b in c_batches),
+                                    c_start_epoch=c_start_epoch, c_start_batch=c_start_position)
         synchronize()
         record = dict(update=step + 1, epoch=current_epoch, mg_mode=args.mg_mode,
                       precision=args.precision, num_iterations=active_num_iterations,
                       backprop_iterations=min(TRAIN_BACKPROP_ITERATIONS, active_num_iterations),
                       gradient_scale=scaler.get_scale(), dropout_enabled=False,
-                      schema_version=2, probe_pairs=args.probe_pairs, pair_offset=args.probe_pair_offset, episodes=episodes,
-                      init_model=args.init_model, optimizer_state="fresh" if step == 0 else "live",
+                      schema_version=3 if extended_probe else 2, probe_pairs=args.probe_pairs, pair_offset=args.probe_pair_offset, episodes=episodes,
+                      init_model=args.init_model, optimizer_state=optimizer_state_label,
+                      muon_bprime=extended_probe, abc=args.probe_abc,
+                      c_source="validation" if args.probe_abc else None,
+                      c_path=_val_path if args.probe_abc else None,
+                      transfer_radius=args.probe_transfer_radius,
                       probe_only=args.probe_only, alignment_only=args.probe_alignment_only,
                       matrix_lr=MATRIX_LR * lrm, weight_decay=wd,
-                      probe_seconds=time.time() - probe_start, measurements=measurements)
+                      probe_seconds=time.time() - probe_start,
+                      peak_allocated_memory_mib=get_max_memory() / (1024 ** 2), measurements=measurements)
         if master_process:
             with open(os.path.join(run_dir, "probes.jsonl"), "a") as probe_file:
                 probe_file.write(json.dumps(record, allow_nan=False) + "\n")
@@ -1511,7 +1557,20 @@ while current_epoch <= args.num_epochs:
                     print0(f"  radius {trial['radius']} | delta B: {trial['b_loss_change']:+.6f} "
                            f"| cos(B,Bprime): {trial['cosine_b_b_prime']} "
                            f"| relative gradient change: {trial['relative_b_gradient_change']}")
-        print0(f"Probes saved ({record['probe_seconds']:.1f}s)")
+                if "muon_b_prime" in trial:
+                    muon = trial["muon_b_prime"]
+                    print0(f"    Muon cos(A,Bprime): {muon['cosine_muon_a_b_prime']} "
+                           f"| cos(B,Bprime): {muon['cosine_muon_b_b_prime']} "
+                           f"| cos(paired,meta): {muon['cosine_muon_paired_meta']}")
+            for transfer in measurement.get("transfer_baselines", []):
+                print0(f"  C {transfer['source']}/{transfer['transform']} "
+                       f"| delta C: {transfer['c_loss_change']:+.6f}")
+            for trial in measurement["trials"]:
+                for transfer in trial.get("transfer", []):
+                    print0(f"  C {transfer['source']}/{transfer['transform']} "
+                           f"| A radius: {trial['radius']} | delta C: {transfer['c_loss_change']:+.6f}")
+        print0(f"Probes saved ({record['probe_seconds']:.1f}s) "
+               f"| peak allocated memory: {record['peak_allocated_memory_mib']:.1f} MiB")
         del capture_episodes, measurements
         if args.probe_only:
             print0("Profiling complete; no optimizer update applied")

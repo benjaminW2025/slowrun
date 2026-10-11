@@ -49,13 +49,18 @@ class FullTrainingTests(unittest.TestCase):
             generator = torch.Generator().manual_seed(7)
             torch.save(dict(tokens=torch.randint(0, 63, (17 * 128,), generator=generator),
                             doc_starts=torch.tensor([0]), bos_id=50256, seq_shuffle_seed=42), dataset)
+        validation = Path(temp) / 'validation.pt'
+        if not validation.exists():
+            generator = torch.Generator().manual_seed(123)
+            torch.save(dict(tokens=torch.randint(0, 63, (17 * 128,), generator=generator),
+                            doc_starts=torch.tensor([0]), bos_id=50256, seq_shuffle_seed=42), validation)
         command = [sys.executable, '-c', HARNESS, str(TRAIN),
                    '--precision', 'fp32', '--no-compile', '--n_layer', '2',
                    '--n_head', '4', '--n_embd', '32', '--device-batch-size', '1',
                    '--virtual-ranks', '2', '--total-batch-size', '64',
                    '--schedule-steps', '3', '--max-train-steps', '3', '--eval-tokens', '64',
                    '--iteration-transition-ratio', '0.67', '--dropout', '0',
-                   '--input_bin', str(dataset), '--input_val_bin', str(dataset),
+                   '--input_bin', str(dataset), '--input_val_bin', str(validation),
                    '--mg-mode', mode, '--run-name', mode, *extra]
         environment = {k: v for k, v in os.environ.items() if k not in ('RANK', 'LOCAL_RANK', 'WORLD_SIZE')}
         environment['CUDA_VISIBLE_DEVICES'] = ''
@@ -101,5 +106,54 @@ class FullTrainingTests(unittest.TestCase):
             self.assertEqual(len(events[0]['measurements']), 6)
             # QKV can legitimately be zero at initialization; MLP output cannot.
             self.assertTrue(all(m['gradient_a_norm'] > 0 for m in events[0]['measurements'] if m['mode'] == 'mlp'))
+
+    def test_extended_abc_profile_uses_validation_and_exports_summaries(self):
+        with tempfile.TemporaryDirectory() as temp:
+            output, run = self.run_training(temp, 'off', [
+                '--iteration-schedule', 'constant', '--probe-every', '1',
+                '--probe-pairs', '2', '--probe-pair-offset', '1',
+                '--probe-modes', 'qk,v,mlp', '--probe-radii', '.1,.5',
+                '--probe-alignment-only', '--probe-only', '--probe-muon-bprime', '--probe-abc'])
+            self.assertIn('Muon cos(A,Bprime)', output)
+            self.assertIn('C paired/muon', output)
+            self.assertFalse((run / 'model.pt').exists())
+            event = json.loads((run / 'probes.jsonl').read_text())
+            self.assertEqual(event['schema_version'], 3)
+            self.assertEqual(event['optimizer_state'], 'fresh')
+            self.assertEqual(event['c_source'], 'validation')
+            self.assertTrue(event['c_path'].endswith('validation.pt'))
+            self.assertEqual(len(event['measurements']), 6)
+            self.assertEqual([e['c_start_batch'] for e in event['episodes']], [1, 2])
+            for m in event['measurements']:
+                self.assertEqual(len(m['transfer_baselines']), 12)
+                self.assertEqual(len(m['trials']), 2)
+                self.assertEqual(len(m['trials'][0]['transfer']), 6)
+            for flag in ('--muon-bprime', '--transfer'):
+                result = subprocess.run([sys.executable, str(TRAIN.with_name('summarize_probes.py')),
+                                         str(run / 'probes.jsonl'), flag, '--aggregate'],
+                                        capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn('2 pairs', result.stdout)
+                if flag == '--transfer':
+                    self.assertIn('C-hurt=', result.stdout)
+                    self.assertIn('vs_paired_c_change', result.stdout)
+
+    def test_online_extended_probes_preserve_training_updates(self):
+        with tempfile.TemporaryDirectory() as temp:
+            _, baseline = self.run_training(temp, 'v', ['--update-ema-every', '0', '--dropout', '.2'])
+            _, probed = self.run_training(temp, 'v', [
+                '--run-name', 'v-probed', '--update-ema-every', '0', '--dropout', '.2',
+                '--probe-every', '1', '--probe-pairs', '1',
+                '--probe-modes', 'qk,v,mlp', '--probe-radii', '.1',
+                '--probe-alignment-only', '--probe-muon-bprime', '--probe-abc'])
+            probed = Path(temp) / 'runs' / 'v-probed'
+            original = torch.load(baseline / 'model.pt', weights_only=True)
+            profiled = torch.load(probed / 'model.pt', weights_only=True)
+            self.assertEqual(original.keys(), profiled.keys())
+            for name in original:
+                torch.testing.assert_close(original[name], profiled[name], rtol=0, atol=0)
+            events = [json.loads(line) for line in (probed / 'probes.jsonl').read_text().splitlines()]
+            self.assertEqual([e['optimizer_state'] for e in events], ['fresh', 'live', 'live'])
+            self.assertEqual([e['episodes'][0]['c_start_batch'] for e in events], [0, 1, 2])
 
 if __name__ == '__main__': unittest.main()

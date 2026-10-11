@@ -253,9 +253,10 @@ class DiagnosticsTests(unittest.TestCase):
                       step=2, current_epoch=1, active_num_iterations=2, TRAIN_BACKPROP_ITERATIONS=1,
                       muon_step_fused=self.ns['muon_step_fused'], autocast_ctx=nullcontext(),
                       scaler=SimpleNamespace(get_scale=lambda: 128), MATRIX_LR=.032, lrm=1., wd=.8,
-                      synchronize=lambda: None, print0=lambda *a, **k: None,
+                      synchronize=lambda: None, get_max_memory=lambda: 0, print0=lambda *a, **k: None,
                       args=SimpleNamespace(probe_pairs=1, probe_pair_offset=0, probe_alignment_only=True, probe_only=True,
-                                           mg_mode='off', precision='fp32', init_model='checkpoint.pt'),
+                                           mg_mode='off', precision='fp32', init_model='checkpoint.pt',
+                                           probe_muon_bprime=False, probe_abc=False, probe_transfer_radius=.1),
                       time=time, os=os, json=json, sys=sys, master_process=True, run_dir=run_dir,
                       dist=SimpleNamespace(is_initialized=lambda: False),
                       wandb_run=SimpleNamespace(finish=lambda: None))
