@@ -290,3 +290,33 @@ results record both independent radii. Compare corresponding validation curves
 and the same final weight variant, then repeat contenders with another seed.
 To attribute a combined gain to interaction rather than the smaller V radius,
 also run V alone at the matching radius (`MG_STEP_NORM=0.05` or `0.1`).
+
+
+### Cautious versus standard Muon weight decay: four training arms
+
+`--muon-weight-decay cautious` (default) preserves the sign-gated matrix decay.
+`--muon-weight-decay standard` applies decay to every active Muon matrix entry.
+Only the decay mask changes: Muon history, learning direction, AdamW groups,
+meta-gradient procedure and weight-decay schedule are unchanged. Inactive matrices
+still receive no update. The chosen mode is printed and recorded in result.json.
+
+On one GPU, run all four arms sequentially:
+
+```bash
+bash research/rtx8000_meta/run_decay_ablation.sh 0 42
+```
+
+For a shorter initial screen with an unchanged 500-step schedule:
+
+```bash
+TRAIN_STEPS=100 SCHEDULE_STEPS=500 bash research/rtx8000_meta/run_decay_ablation.sh 0 42
+```
+
+This is four training runs, not a five-minute test. Existing model dimensions,
+sequence length, precision and device batch size are preserved. CUDA initialization
+and GPU memory fit must be checked separately. For parallel execution on separately
+available GPUs use run_training.sh with MUON_WEIGHT_DECAY=cautious/standard and
+arm off/mlp. Default MLP temporary norm is 0.5; V is not perturbed in this ablation.
+Compare the meta-on minus meta-off validation-loss difference under each decay
+rule at equal steps, then compare those differences. Short-run results screen a
+hypothesis; full runs and another seed are needed to confirm it.

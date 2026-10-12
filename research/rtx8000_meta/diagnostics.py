@@ -79,7 +79,7 @@ def _gradients(forward_loss, batches, params, scale):
 def preview_muon(optimizer, params, grads, muon_step):
     """Run the production Muon kernel on private copies of selected state slices.
 
-    Returns native displacement without decay and native cautious-decay displacement.
+    Returns native displacement without decay and native configured-decay displacement.
     World-size-one optimizer state layout is required, as in this experiment.
     """
     ids = {id(p): i for i, p in enumerate(params)}
@@ -111,7 +111,8 @@ def preview_muon(optimizer, params, grads, muon_step):
         for slot, p, delta in zip(slots, selected, scratch.unbind()):
             descent[slot] = delta.clone()
             # d = -lr*g, so g*w >= 0 iff d*w <= 0 (all eligible LRs are positive).
-            mask = (delta * p) <= 0
+            mask = ((delta * p) <= 0 if group.get("weight_decay_mode", "cautious") == "cautious"
+                    else torch.ones_like(p, dtype=torch.bool))
             masks[slot] = mask
             decay[slot] = -lr * group['weight_decay'] * p.detach() * mask
     if any(x is None for x in descent): raise ValueError('Probe includes non-Muon parameters')

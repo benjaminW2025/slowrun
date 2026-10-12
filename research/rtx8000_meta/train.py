@@ -92,6 +92,8 @@ parser.add_argument("--weight-decay", type=float, default=0.8)
 #   [0, wd-phase1-epoch]:          hold at --weight-decay
 #   [wd-phase1-epoch, wd-phase2-epoch]: decay to --wd-mid
 #   [wd-phase2-epoch, num-epochs]:      ramp up to --wd-end
+parser.add_argument("--muon-weight-decay", choices=("cautious", "standard"), default="cautious",
+                    help="Muon matrix decay: current sign-gated rule or unconditional decoupled decay. AdamW is unchanged.")
 parser.add_argument("--wd-phase1-epoch", type=int, default=2)
 parser.add_argument("--wd-phase2-epoch", type=int, default=8)
 parser.add_argument("--wd-mid", type=float, default=0.1)
@@ -773,7 +775,7 @@ def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_
 
 @torch.compile(dynamic=False, fullgraph=True)
 def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momentum_buffer,
-                    momentum_t, lr_t, wd_t, beta2_t, active_mask, ns_steps, red_dim):
+                    momentum_t, lr_t, wd_t, beta2_t, active_mask, ns_steps, red_dim, cautious_decay=True):
     momentum = momentum_t.to(stacked_grads.dtype)
     active = active_mask.to(stacked_grads.dtype)
     momentum_update = (1 - momentum) * active
@@ -811,7 +813,8 @@ def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momen
     # Cautious weight decay + update
     lr = lr_t.to(g.dtype)
     wd = wd_t.to(g.dtype)
-    mask = (g * stacked_params) >= 0
+    mask = ((g * stacked_params) >= 0 if cautious_decay
+            else torch.ones_like(stacked_params, dtype=torch.bool))
     stacked_params.sub_((lr * g + lr * wd * stacked_params * mask) * active)
 
 
@@ -936,7 +939,8 @@ class DistMuonAdamW(torch.optim.Optimizer):
                           state["momentum_buffer"][:num_owned], state["second_momentum_buffer"][:num_owned],
                           self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t, self._muon_beta2_t,
                           info["active_mask"][start_idx:start_idx + num_owned],
-                          group["ns_steps"], red_dim)
+                          group["ns_steps"], red_dim,
+                          cautious_decay=group.get("weight_decay_mode", "cautious") == "cautious")
             updated[:num_owned].copy_(owned)
         if num_owned < chunk_size:
             updated[num_owned:].zero_()
@@ -1215,6 +1219,7 @@ print0(f"  total_batch_size={TOTAL_BATCH_SIZE}, device_batch_size={args.device_b
 print0(f"  seed={args.seed}, precision={args.precision}, loss_scale={args.loss_scale}, virtual_ranks={args.virtual_ranks}")
 print0(f"  mg_mode={args.mg_mode}, mg_step_norm={args.mg_step_norm}, schedule_steps={args.schedule_steps}")
 print0(f"  matrix_lr={MATRIX_LR}, scalar_lr={SCALAR_LR}, embedding_lr={EMBEDDING_LR}, unembedding_lr={UNEMBEDDING_LR}")
+print0(f"  muon_weight_decay={args.muon_weight_decay}")
 print0(f"  weight_decay={WEIGHT_DECAY}, adam_betas={ADAM_BETAS}")
 print0(f"  wd_schedule=hold {args.weight_decay} -> mid {args.wd_mid} -> end {args.wd_end}")
 print0(
@@ -1288,6 +1293,9 @@ model = orig_model if args.no_compile else torch.compile(model, dynamic=False)
 
 # Optimizer
 optimizer = model.setup_optimizer()
+for group in optimizer.param_groups:
+    if group["kind"] == "muon":
+        group["weight_decay_mode"] = args.muon_weight_decay
 
 # The final update always uses the copied submission's Muon+AdamW optimizer.
 # Only these Muon-managed matrices are changed during each temporary A trial.
@@ -1809,6 +1817,7 @@ if master_process:
         "raw_final_val_bpb": raw_final_bpb,
         "matrix_lr": args.matrix_lr,
         "weight_decay": args.weight_decay,
+        "muon_weight_decay": args.muon_weight_decay,
         "wd_mid": args.wd_mid,
         "wd_end": args.wd_end,
         "dropout": args.dropout,

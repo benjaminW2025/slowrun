@@ -59,6 +59,30 @@ class SingleProcessOptimizerTests(unittest.TestCase):
         self.assertFalse(torch.equal(matrix, before_matrix))
         self.assertEqual(optimizer.state[adam]['step'], 2)
 
+    def test_decay_modes_change_only_decay_not_muon_history(self):
+        optimizer_type = load_optimizer()
+        initial = torch.tensor([[.4, -.2], [-.3, .5]])
+        grad = torch.tensor([[.1, .3], [-.2, .4]])
+        runs = {}
+        for mode, wd in [('cautious', .4), ('standard', .4), ('none', 0.)]:
+            p = torch.nn.Parameter(initial.clone())
+            inactive = torch.nn.Parameter(initial.clone())
+            opt = optimizer_type([dict(kind='muon', params=[p, inactive], lr=.02,
+                                      momentum=.9, beta2=.95, ns_steps=5,
+                                      weight_decay=wd, weight_decay_mode=mode)])
+            p.grad = grad.clone()
+            opt.step()
+            torch.testing.assert_close(inactive, initial, rtol=0, atol=0)
+            runs[mode] = (p.detach().clone(), opt.state[p])
+        direction = (initial - runs['none'][0]) / .02
+        mask = (initial * direction) >= 0
+        torch.testing.assert_close(runs['standard'][0], runs['none'][0] - .02 * .4 * initial)
+        torch.testing.assert_close(runs['cautious'][0], runs['none'][0] - .02 * .4 * initial * mask)
+        self.assertTrue(bool(mask.any()) and bool((~mask).any()))
+        for key in ('momentum_buffer', 'second_momentum_buffer'):
+            torch.testing.assert_close(runs['standard'][1][key], runs['cautious'][1][key], rtol=0, atol=0)
+
+
 
 if __name__ == '__main__':
     unittest.main()

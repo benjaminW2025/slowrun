@@ -102,7 +102,15 @@ class UpstreamAuditTests(unittest.TestCase):
         expected_muon = copy.deepcopy(base['muon_step_fused'])
         for n in ast.walk(expected_muon):
             if isinstance(n, ast.Attribute) and n.attr == 'bfloat16': n.attr = 'float'
-        self.assertEqual(ast.dump(expected_muon), ast.dump(experiment['muon_step_fused']))
+        # The new opt-in decay branch must preserve the original default math.
+        actual_muon = copy.deepcopy(experiment['muon_step_fused'])
+        self.assertEqual(actual_muon.args.args.pop().arg, 'cautious_decay')
+        self.assertTrue(actual_muon.args.defaults.pop().value)
+        for n in ast.walk(actual_muon):
+            if isinstance(n, ast.Assign) and isinstance(n.value, ast.IfExp):
+                if any(isinstance(t, ast.Name) and t.id == 'mask' for t in n.targets):
+                    n.value = n.value.body
+        self.assertEqual(ast.dump(expected_muon), ast.dump(actual_muon))
         # Original PR uses the same optimizer setup as the older baseline.
         pm = definitions(definitions(self.meta)['GPT'])
         self.assertEqual(ast.dump(bm['setup_optimizer']), ast.dump(pm['setup_optimizer']))
