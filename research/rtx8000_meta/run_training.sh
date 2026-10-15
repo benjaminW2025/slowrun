@@ -14,8 +14,11 @@ train_v_radius=${MG_V_STEP_NORM:-0.1}
 case "$train_arm" in off|qk|v|mlp|qkv|mlp_v) ;; *) echo "Unknown arm: $train_arm" >&2; exit 2 ;; esac
 train_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 cd -- "$train_root"
-train_python=python
-if [[ -x .venv/bin/python ]]; then train_python=.venv/bin/python; fi
+train_python=${TRAIN_PYTHON:-}
+if [[ -z "$train_python" ]]; then
+  train_python=python
+  if [[ -x .venv/bin/python ]]; then train_python=.venv/bin/python; fi
+fi
 train_tag="d${train_radius}"
 if [[ "$train_arm" == mlp_v ]]; then train_tag="mlp${train_mlp_radius}-v${train_v_radius}"; fi
 train_name="confirm-${train_arm}-${train_order}-${train_decay}-${train_tag}-s${train_seed}-$(date +%Y%m%d-%H%M%S)-$$"

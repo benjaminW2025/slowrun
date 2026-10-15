@@ -379,3 +379,12 @@ gradient/input storage. It is not a free computation change; runtime and peak
 memory on CUDA are unverified. The initial comparison is at equal tokens/steps,
 not equal compute. `--mg-order oneway` remains the default, and the chosen order
 is printed, recorded in result.json and included in launcher run names.
+
+
+### Separate Python environment
+
+The training launcher accepts `TRAIN_PYTHON` to override its default `.venv`.
+This also works through run_v_sweep.sh, run_symmetry.sh and run_decay_ablation.sh.
+For example, `TRAIN_PYTHON=.venv-meta/bin/python bash
+research/rtx8000_meta/run_training.sh mlp_v 0 42` uses the separate environment.
+Simply activating another environment does not override the launcher's default.
