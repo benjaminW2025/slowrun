@@ -320,3 +320,30 @@ arm off/mlp. Default MLP temporary norm is 0.5; V is not perturbed in this ablat
 Compare the meta-on minus meta-off validation-loss difference under each decay
 rule at equal steps, then compare those differences. Short-run results screen a
 hypothesis; full runs and another seed are needed to confirm it.
+
+
+### 100-step V-radius training sweep
+
+```bash
+bash research/rtx8000_meta/run_v_sweep.sh 0 42
+```
+
+Runs five fresh arms sequentially: V step norms 0, 0.025, 0.1, 0.25, 0.5;
+MLP step norm is fixed at 0.5. The zero-V arm is the MLP-only control (V
+weights still train). The launcher explicitly fixes 100 optimizer steps, a
+500-step schedule, cautious decay and the same seed for every arm, overriding
+inherited settings for those variables. Other settings come from run_training.sh.
+This is 500 training steps total, not 100 total. Every arm has a unique output
+folder under runs/confirm-mlp_v-cautious-mlp0.5-v*. Compare raw_final_val_loss
+across arms; confirm promising settings at 500 steps before claiming a gain.
+
+To split across two separately available GPUs, use disjoint radius subsets:
+
+```bash
+bash research/rtx8000_meta/run_v_sweep.sh 0 42 "0 0.025 0.1"
+bash research/rtx8000_meta/run_v_sweep.sh 1 42 "0.25 0.5"
+```
+
+Both commands have the same settings. Reusing earlier 100-step measurements is
+valid only if their exact step, initialization, schedule and evaluation match;
+the launcher does not automatically reuse earlier runs.
