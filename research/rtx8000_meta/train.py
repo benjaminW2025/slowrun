@@ -53,6 +53,8 @@ parser.add_argument("--mg-mode", choices=("off", "mlp", "qk", "v", "qkv", "mlp_v
                     help="Matrices receiving the temporary A-gradient step; off is the paired baseline.")
 parser.add_argument("--mg-step-norm", type=float, default=0.5,
                     help="Euclidean norm of each rank-local temporary step, as in Tiny PR #99.")
+parser.add_argument("--mg-order", choices=("oneway", "symmetric"), default="oneway",
+                    help="One-way A-to-B or both A-to-B and B-to-A averaged before one optimizer step.")
 parser.add_argument("--mg-mlp-step-norm", type=float, default=0.5,
                     help="Independent MLP temporary-step norm in mlp_v mode; zero disables that perturbation.")
 parser.add_argument("--mg-v-step-norm", type=float, default=0.1,
@@ -1217,6 +1219,7 @@ print0(f"  n_layer={DEPTH}, n_embd={N_EMBD}, n_head={N_HEAD}, head_dim={HEAD_DIM
 print0(f"  seq_len={MAX_SEQ_LEN}, window_pattern={WINDOW_PATTERN}")
 print0(f"  total_batch_size={TOTAL_BATCH_SIZE}, device_batch_size={args.device_batch_size}")
 print0(f"  seed={args.seed}, precision={args.precision}, loss_scale={args.loss_scale}, virtual_ranks={args.virtual_ranks}")
+print0(f"  mg_order={args.mg_order}")
 print0(f"  mg_mode={args.mg_mode}, mg_step_norm={args.mg_step_norm}, schedule_steps={args.schedule_steps}")
 print0(f"  matrix_lr={MATRIX_LR}, scalar_lr={SCALAR_LR}, embedding_lr={EMBEDDING_LR}, unembedding_lr={UNEMBEDDING_LR}")
 print0(f"  muon_weight_decay={args.muon_weight_decay}")
@@ -1480,7 +1483,7 @@ while current_epoch <= args.num_epochs:
         train_loss, x, y, epoch = collect_virtual_gradients(
             model, trainable_params, trial_params, x, y, lambda: next(train_loader),
             forward_loss, scaler, args.virtual_ranks, microsteps_per_half, args.mg_step_norm,
-            capture_episodes=capture_episodes, trial_groups=trial_groups,
+            capture_episodes=capture_episodes, trial_groups=trial_groups, symmetric=args.mg_order == "symmetric",
         )
 
     # Update optimizer
@@ -1806,6 +1809,7 @@ if master_process:
         "loss_scale": args.loss_scale,
         "virtual_ranks": args.virtual_ranks,
         "mg_mode": args.mg_mode,
+        "mg_order": args.mg_order,
         "mg_step_norm": args.mg_step_norm,
         "mg_mlp_step_norm": args.mg_mlp_step_norm if args.mg_mode == "mlp_v" else None,
         "mg_v_step_norm": args.mg_v_step_norm if args.mg_mode == "mlp_v" else None,

@@ -91,6 +91,78 @@ def _temporary_group_step(trial_params, groups):
     return original
 
 
+def _collect_symmetric_gradients(model, trainable_params, trial_params, x, y, next_batch,
+                                forward_loss, scaler, virtual_ranks, microsteps_per_half,
+                                step_norm, capture_episode, capture_episodes, trial_groups):
+    """Average A, B, B-at-A and A-at-B; replay each batch's dropout masks."""
+    total = 4 * virtual_ranks * microsteps_per_half
+    accumulated = [None] * len(trainable_params)
+    loss_sum = x.new_zeros((), dtype=torch.float32)
+    epoch = None
+    devices = [x.device.index if x.device.index is not None else torch.cuda.current_device()] if x.is_cuda else []
+
+    def add_gradients():
+        for i, p in enumerate(trainable_params):
+            if p.grad is not None:
+                if accumulated[i] is None:
+                    accumulated[i] = p.grad.detach().clone()
+                else:
+                    accumulated[i].add_(p.grad)
+
+    for rank in range(virtual_ranks):
+        batches, directions = [[], []], []
+        destination = (capture_episodes[rank] if capture_episodes is not None
+                       and rank < len(capture_episodes) else
+                       capture_episode if rank == 0 else None)
+        # Original gradients for both halves, before any temporary perturbation.
+        for half in range(2):
+            model.zero_grad(set_to_none=True)
+            for _ in range(microsteps_per_half):
+                cpu_rng = torch.get_rng_state()
+                gpu_rng = torch.cuda.get_rng_state(devices[0]) if devices else None
+                batches[half].append((x.detach(), y.detach(), cpu_rng, gpu_rng))
+                if destination is not None:
+                    destination[half].append((x.detach(), y.detach()))
+                loss = forward_loss(x, y)
+                loss_sum = loss_sum + loss.detach() / total
+                scaler.scale(loss).backward()
+                x, y, epoch = next_batch()
+            if any(p.grad is None for p in trial_params):
+                raise RuntimeError("Missing symmetric temporary-step gradients")
+            directions.append([p.grad.detach().clone() for p in trial_params])
+            add_gradients()
+        for source, target in ((0, 1), (1, 0)):
+            model.zero_grad(set_to_none=True)
+            for p, grad in zip(trial_params, directions[source]):
+                p.grad = grad
+            original = None
+            try:
+                if trial_params:
+                    original = (_temporary_group_step(trial_params, trial_groups)
+                                if trial_groups is not None else
+                                _temporary_step(trial_params, step_norm))
+                model.zero_grad(set_to_none=True)
+                # Reuse masks from the original evaluation, without advancing
+                # the persistent RNG stream or consuming more training examples.
+                with torch.random.fork_rng(devices=devices):
+                    for bx, by, cpu_rng, gpu_rng in batches[target]:
+                        torch.set_rng_state(cpu_rng)
+                        if devices:
+                            torch.cuda.set_rng_state(gpu_rng, devices[0])
+                        loss = forward_loss(bx, by)
+                        loss_sum = loss_sum + loss.detach() / total
+                        scaler.scale(loss).backward()
+                add_gradients()
+            finally:
+                if original is not None:
+                    with torch.no_grad():
+                        torch._foreach_copy_(trial_params, original)
+    model.zero_grad(set_to_none=True)
+    for p, grad in zip(trainable_params, accumulated):
+        p.grad = grad.div_(total) if grad is not None else None
+    return loss_sum, x, y, epoch
+
+
 def collect_virtual_gradients(
     model,
     trainable_params,
@@ -106,6 +178,7 @@ def collect_virtual_gradients(
     capture_episode=None,
     capture_episodes=None,
     trial_groups=None,
+    symmetric=False,
 ):
     """Run rank-local A/B trials and leave their averaged gradient in p.grad.
 
@@ -127,6 +200,11 @@ def collect_virtual_gradients(
 
     if capture_episode is not None and capture_episodes is not None:
         raise ValueError("Use capture_episode or capture_episodes, not both")
+    if symmetric:
+        return _collect_symmetric_gradients(
+            model, trainable_params, trial_params, x, y, next_batch, forward_loss, scaler,
+            virtual_ranks, microsteps_per_half, step_norm, capture_episode, capture_episodes,
+            trial_groups)
     for virtual_rank in range(virtual_ranks):
         model.zero_grad(set_to_none=True)
         original_weights = None

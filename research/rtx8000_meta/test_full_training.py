@@ -92,6 +92,16 @@ class FullTrainingTests(unittest.TestCase):
                     for name in ('transformer.h.0.attn.c_proj.weight', 'transformer.h.0.mlp.c_proj.weight'):
                         self.assertGreater(float(weights[name].norm()), 0)
 
+    def test_symmetric_training_all_weights_and_recurrence(self):
+        for mode in ('mlp', 'mlp_v'):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temp:
+                output, run = self.run_training(temp, mode, ['--mg-order', 'symmetric', '--mg-v-step-norm', '.025'])
+                report = json.loads((run / 'result.json').read_text())
+                self.assertEqual(report['mg_order'], 'symmetric')
+                self.assertEqual(report['effective_train_tokens'], 3 * 64)
+                self.assertIn('Gradient check:', output)
+                self.assertTrue(torch.isfinite(torch.tensor(report['raw_final_val_loss'])))
+
     def test_four_decay_ablation_arms_run_and_record_mode(self):
         for decay in ('cautious', 'standard'):
             for mode in ('off', 'mlp'):

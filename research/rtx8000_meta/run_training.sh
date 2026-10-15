@@ -7,6 +7,7 @@ train_seed=${3:-42}
 train_steps=${TRAIN_STEPS:-500}
 train_schedule=${SCHEDULE_STEPS:-$train_steps}
 train_decay=${MUON_WEIGHT_DECAY:-cautious}
+train_order=${MG_ORDER:-oneway}
 train_radius=${MG_STEP_NORM:-0.5}
 train_mlp_radius=${MG_MLP_STEP_NORM:-0.5}
 train_v_radius=${MG_V_STEP_NORM:-0.1}
@@ -17,11 +18,11 @@ train_python=python
 if [[ -x .venv/bin/python ]]; then train_python=.venv/bin/python; fi
 train_tag="d${train_radius}"
 if [[ "$train_arm" == mlp_v ]]; then train_tag="mlp${train_mlp_radius}-v${train_v_radius}"; fi
-train_name="confirm-${train_arm}-${train_decay}-${train_tag}-s${train_seed}-$(date +%Y%m%d-%H%M%S)-$$"
+train_name="confirm-${train_arm}-${train_order}-${train_decay}-${train_tag}-s${train_seed}-$(date +%Y%m%d-%H%M%S)-$$"
 export CUDA_VISIBLE_DEVICES="$train_gpu"
 export WANDB_MODE=disabled
 "$train_python" research/rtx8000_meta/train.py \
-  --mg-mode "$train_arm" --mg-step-norm "$train_radius" \
+  --mg-mode "$train_arm" --mg-order "$train_order" --mg-step-norm "$train_radius" \
   --mg-mlp-step-norm "$train_mlp_radius" --mg-v-step-norm "$train_v_radius" \
   --muon-weight-decay "$train_decay" \
   --precision fp16 --loss-scale 128 --no-compile \

@@ -233,6 +233,78 @@ class VirtualRankTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             _temporary_group_step(params, [(params, .5), ([params[0]], .1)])
 
+    def test_symmetric_matches_explicit_four_gradient_reference(self):
+        for grouped in (False, True):
+            model = TinyModel()
+            params = list(model.parameters())
+            before = [p.detach().clone() for p in params]
+            expected = [torch.zeros_like(p) for p in params]
+            data = self.batches * 2
+            selected = params if grouped else params[:1]
+            radii = [.5, .025] if grouped else [.5]
+            for start in (0, 4):
+                halves = [data[start:start+2], data[start+2:start+4]]
+                def gradient(half):
+                    return torch.autograd.grad(sum(model(*b) for b in half) / 2, params)
+                ga, gb = gradient(halves[0]), gradient(halves[1])
+                shifted = []
+                for source, target in ((ga, halves[1]), (gb, halves[0])):
+                    with torch.no_grad():
+                        for i, radius in enumerate(radii):
+                            params[i].sub_(radius * source[i] / source[i].norm())
+                    shifted.append(gradient(target))
+                    with torch.no_grad():
+                        for p, w in zip(params, before): p.copy_(w)
+                for dst, a, b, bp, ap in zip(expected, ga, gb, *shifted):
+                    dst.add_((a + b + bp + ap) / 8)
+            batches = iter(data[1:] + [data[0]])
+            calls = [0]
+            def next_batch():
+                calls[0] += 1
+                return (*next(batches), 1)
+            capture = [([], []), ([], [])]
+            collect_virtual_gradients(model, params, selected, *data[0], next_batch,
+                                      model, FixedScaler(128), 2, 2, .5,
+                                      capture_episodes=capture, symmetric=True,
+                                      trial_groups=[([p], r) for p, r in zip(selected, radii)] if grouped else None)
+            self.assertEqual(calls[0], 8)
+            self.assertEqual([[len(h) for h in pair] for pair in capture], [[2, 2], [2, 2]])
+            for p, w, want in zip(params, before, expected):
+                torch.testing.assert_close(p, w, rtol=0, atol=0)
+                torch.testing.assert_close(p.grad / 128, want, atol=1e-6, rtol=1e-5)
+
+    def test_symmetric_zero_perturbation_replays_dropout_and_preserves_rng(self):
+        results = []
+        for symmetric in (False, True):
+            model = TinyModel()
+            dropout = nn.Dropout(.3)
+            def forward(x, y):
+                return model(x, y) * dropout(torch.ones(()))
+            batches = iter(self.batches[1:] + [self.batches[0]])
+            torch.manual_seed(17)
+            collect_virtual_gradients(model, list(model.parameters()), [], *self.batches[0],
+                                      lambda: (*next(batches), 1), forward, FixedScaler(128),
+                                      2, 1, .5, symmetric=symmetric)
+            results.append(([p.grad.clone() for p in model.parameters()], torch.get_rng_state()))
+        for a, b in zip(results[0][0], results[1][0]): torch.testing.assert_close(a, b)
+        self.assertTrue(torch.equal(results[0][1], results[1][1]))
+
+    def test_symmetric_shifted_failure_restores_weights(self):
+        model = TinyModel()
+        params = list(model.parameters())
+        before = [p.detach().clone() for p in params]
+        batches = iter(self.batches[1:] + [self.batches[0]])
+        calls = [0]
+        def forward(x, y):
+            calls[0] += 1
+            if calls[0] == 3: raise RuntimeError('shifted failure')
+            return model(x, y)
+        with self.assertRaisesRegex(RuntimeError, 'shifted failure'):
+            collect_virtual_gradients(model, params, params[:1], *self.batches[0],
+                                      lambda: (*next(batches), 1), forward, FixedScaler(128),
+                                      2, 1, .5, symmetric=True)
+        for p, w in zip(params, before): torch.testing.assert_close(p, w, rtol=0, atol=0)
+
     def test_matrix_selection(self):
         weights = {
             name: nn.Parameter(torch.ones(2, 2))

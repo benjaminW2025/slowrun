@@ -347,3 +347,35 @@ bash research/rtx8000_meta/run_v_sweep.sh 1 42 "0.25 0.5"
 Both commands have the same settings. Reusing earlier 100-step measurements is
 valid only if their exact step, initialization, schedule and evaluation match;
 the launcher does not automatically reuse earlier runs.
+
+
+### Symmetric A/B: 100-step ordering comparison
+
+```bash
+bash research/rtx8000_meta/run_symmetry.sh 0 42
+```
+
+Runs MLP-only one-way and symmetric training sequentially. Both use 100 steps,
+a 500-step schedule, MLP norm 0.5, cautious decay, seed 42, and fresh weights.
+The default isolates ordering from the ongoing V sweep. To test MLP+V with V
+norm 0.025 instead, add `mlp_v` as the third argument. To run only symmetry
+against an existing matched reference:
+
+```bash
+bash research/rtx8000_meta/run_symmetry.sh 0 42 mlp symmetric
+```
+
+Symmetry computes gA and gB at the original weights, gBprime after a temporary
+A step, and gAprime after a temporary B step. Each temporary branch starts at
+the original weights. The four gradients receive equal weight and are averaged
+across virtual ranks before one Muon/Adam update. Group norms work identically
+in either direction; weights restore even if a shifted backward fails. Replay
+evaluations reuse the corresponding original batch's dropout masks, preserving
+the persistent RNG stream. Only the original A and B examples advance the data
+loader. All optimizer-managed weights continue training.
+
+This doubles forward/backward evaluations per consumed training token and adds
+gradient/input storage. It is not a free computation change; runtime and peak
+memory on CUDA are unverified. The initial comparison is at equal tokens/steps,
+not equal compute. `--mg-order oneway` remains the default, and the chosen order
+is printed, recorded in result.json and included in launcher run names.

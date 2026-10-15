@@ -104,8 +104,9 @@ class DiagnosticsTests(unittest.TestCase):
     def test_cpu_fp16_scaler_all_arms_one_and_two_pass_updates(self):
         # Actual FP16 casts, half rotary buffers and GradScaler, on CPU. This
         # exercises precision/scale semantics but does not validate CUDA kernels.
-        for mode in ('off', 'qk', 'v', 'mlp', 'mlp_v'):
-            with self.subTest(mode=mode):
+        for mode, order in ([(m, 'oneway') for m in ('off', 'qk', 'v', 'mlp', 'mlp_v')]
+                            + [('mlp', 'symmetric'), ('mlp_v', 'symmetric')]):
+            with self.subTest(mode=mode, order=order):
                 ns = load(ast.parse(Path(__file__).with_name('train.py').read_text()), LocalOnly())
                 ns['ACTIVATION_DTYPE'] = torch.float16
                 torch.manual_seed(42)
@@ -128,7 +129,7 @@ class DiagnosticsTests(unittest.TestCase):
                     batch_iter = iter(self.batches[1:] + [self.batches[0]])
                     loss, *_ = collect_virtual_gradients(
                         model, params, trial, *self.batches[0], lambda: (*next(batch_iter), 1),
-                        forward, scaler, 2, 1, .5, trial_groups=groups)
+                        forward, scaler, 2, 1, .5, trial_groups=groups, symmetric=order == 'symmetric')
                     scaler.unscale_(optimizer)
                     self.assertTrue(bool(torch.isfinite(loss)))
                     validate_gradients(model.named_parameters(), ids)

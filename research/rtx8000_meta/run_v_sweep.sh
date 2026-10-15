@@ -9,6 +9,6 @@ sweep_script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 for sweep_radius in "${sweep_radii[@]}"; do
   echo "V sweep: MLP=0.5 V=$sweep_radius, 100 steps / 500-step schedule, cautious decay, seed=$sweep_seed"
   TRAIN_STEPS=100 SCHEDULE_STEPS=500 MUON_WEIGHT_DECAY=cautious \
-  MG_STEP_NORM=0.5 MG_MLP_STEP_NORM=0.5 MG_V_STEP_NORM="$sweep_radius" \
+  MG_ORDER=oneway MG_STEP_NORM=0.5 MG_MLP_STEP_NORM=0.5 MG_V_STEP_NORM="$sweep_radius" \
     bash "$sweep_script_dir/run_training.sh" mlp_v "$sweep_gpu" "$sweep_seed"
 done
