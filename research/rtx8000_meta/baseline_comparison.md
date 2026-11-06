@@ -1,3 +1,38 @@
+# First development comparison: one pass per arm
+
+Use the 101,059,795-parameter medium profile, full 100M-token corpus,
+2,048-token context, 32,768-token effective batch and four microbatches
+(two A, two B). Run:
+
+```bash
+git pull --ff-only origin codex/experiments
+python research/rtx8000_meta/compare_baseline.py --profile medium --stage one-pass --gpu 1 --execute
+```
+
+Both arms start fresh and execute sequentially. Each gets 3,050 updates,
+99,942,400 target-token exposures, approximately one corpus pass after
+chunking and tail exclusions. The runner checks that the source training
+file contains exactly 100M tokens. Both evaluate the same 1,048,576 held-out
+target tokens. MLP-minus-control raw final validation loss is the primary
+comparison; report each arm's final model variant separately.
+
+LR, decay, recurrence and SWA schedules span the 3,050-update budget.
+The inherited `num_epochs=15` remains a schedule-phase reference: the explicit
+step cap stops after about one actual pass, not 15. Recurrence switches from
+one to two passes at 70% of the budget. Averaging may have few eligible
+checkpoints in a one-pass run; do not equate an EMA score with a raw score.
+
+At the supplied ~0.67-second two-pass timing, training is approximately
+34 minutes per arm plus startup, evaluation and saving. Other-arm timing
+may differ. The benchmark is not an exact end-to-end runtime prediction.
+
+This is an early-learning development comparison at one seed, not validation
+of the repeated-data hypothesis or a leaderboard reproduction. The result
+should guide the next experiment; multi-pass and multi-seed runs follow only
+when justified. Outputs: `runs/baseline-medium-one-pass-*`.
+
+---
+
 # Default: 101M parameters on one L40
 
 The default is now `--profile medium`: **101,059,795 parameters**, verified

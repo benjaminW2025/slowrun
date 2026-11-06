@@ -11,7 +11,7 @@ import time
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--stage", choices=("smoke", "benchmark", "pilot"), default="smoke")
+    parser.add_argument("--stage", choices=("smoke", "benchmark", "pilot", "one-pass"), default="smoke")
     parser.add_argument("--profile", choices=("medium", "small", "original"), default="medium")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--gpu", default="0")
@@ -21,9 +21,17 @@ def main():
     root = here.parents[1]
     small = args.profile == "small"
     medium = args.profile == "medium"
-    steps = {"smoke": 3, "benchmark": 8, "pilot": 200 if small else 500}[args.stage]
-    schedule = 200 if small else 500
+    one_pass = args.stage == "one-pass"
+    if one_pass and not medium:
+        parser.error("one-pass currently requires --profile medium")
+    # Match loader chunking: 100M source tokens, 2049-token chunks, batch four.
+    # 3050 complete updates cover 99,942,400 targets, about one corpus pass.
+    steps = {"smoke": 3, "benchmark": 8, "pilot": 200 if small else 500,
+             "one-pass": 3050}[args.stage]
+    schedule = steps if one_pass else (200 if small else 500)
     eval_tokens = 8192 if small else (65536 if medium and args.stage == "pilot" else (32768 if args.stage != "pilot" else 262144))
+    if one_pass:
+        eval_tokens = 1048576
     name = f"baseline-{args.profile}-{args.stage}-s{args.seed}-{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}"
     common = ["--precision", "fp16", "--loss-scale", "128", "--no-compile",
               "--device-batch-size", "4" if small or medium else "1", "--virtual-ranks", "1" if small or medium else "8",
@@ -41,7 +49,7 @@ def main():
     if args.stage in ("smoke", "benchmark"):
         # Exercise the previously problematic recurrent backward immediately.
         common += ["--iteration-schedule", "constant", "--num-iterations", "2"]
-    print(f"Profile={args.profile}; {steps} steps/arm; run benchmark before pilot to measure runtime.", flush=True)
+    print(f"Profile={args.profile}; {steps} steps/arm; benchmark measures runtime; one-pass covers approximately 100M target tokens.", flush=True)
     arms = ("off", "mlp")
     # Each arm runs in its own process with the same initialization and loader seed.
     commands = [[sys.executable, str(here / "train.py"), *common,
@@ -73,6 +81,11 @@ def main():
             for chunk in iter(lambda: data.read(1024 * 1024), b""):
                 digest.update(chunk)
         hashes[path.name] = digest.hexdigest()
+    if one_pass:
+        import torch
+        token_count = torch.load(datasets[0], weights_only=True, map_location="cpu")["tokens"].numel()
+        if token_count != 100_000_000:
+            raise ValueError(f"one-pass expects the canonical 100M-token training file, got {token_count}")
     if small:
         import torch
         data = torch.load(datasets[0], weights_only=True, map_location="cpu")
