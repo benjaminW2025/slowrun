@@ -1,3 +1,49 @@
+# Small comparison on one L40
+
+The launcher now defaults to `--profile small`. Previous full-size commands
+remain available only with explicit `--profile original`.
+
+From your GPU checkout after activating the training environment:
+
+```bash
+git pull --ff-only origin codex/experiments
+python research/rtx8000_meta/compare_baseline.py --stage benchmark --gpu 1 --execute
+# Inspect the measured timing and estimate before running:
+python research/rtx8000_meta/compare_baseline.py --stage pilot --gpu 1 --execute
+```
+
+The benchmark runs 8 updates per arm with two recurrent passes throughout,
+reports median step times after the first step, and estimates training time.
+It never starts the pilot automatically. Compilation, evaluation, checkpoint
+writes and startup add time; runtime on the L40 has not been measured locally.
+A 10–20 minute pair is a target, not a measured promise.
+
+The small profile uses four layers, width 256, four heads, context 512,
+physical batch four, one A/B episode, and 8,192 tokens per optimizer update:
+**four microbatches instead of 256**. It retains GPT-2 vocabulary/tokenization.
+The pilot runs 200 updates per arm on a fixed 262,144-token training prefix
+(about six passes), and evaluates 8,192 held-out tokens. The final training
+document may be truncated, and chunk/tail exclusions slightly reduce the
+actual corpus used. The prefix and held-out file are identical across arms.
+
+Temporary MLP adaptation radius is fixed at 0.1 for this smaller model; this
+is an unvalidated starting setting, not a rescaled equivalent of PR #99's 0.5.
+Use this comparison to check training and study a specific small-scale setting.
+A null result cannot reject meta-gradient at other radii or larger scales.
+The very small validation sample and one seed make results exploratory.
+All other settings match between arms. The pilot includes a 1x-to-2x recurrence
+transition; benchmark and smoke exercise two-pass recurrence immediately.
+
+Results and source/data provenance are saved under `runs/baseline-small-*`.
+`comparison.json` contains both arm results; `terminal.log` is in each arm's
+own directory. Raw final validation loss is primary; averaged loss is separate.
+
+---
+
+## Original full-size profile reference
+
+The remainder describes `--profile original` explicitly, not the new default.
+
 # Matched baseline versus MLP meta-gradient
 
 Goal: establish whether the corrected local trainer runs reliably and whether
@@ -27,8 +73,8 @@ From the repository root, activate the existing training environment, then:
 ```bash
 git pull --ff-only fork codex/experiments
 python -m unittest discover -s research/rtx8000_meta -p 'test_*.py'
-python research/rtx8000_meta/compare_baseline.py --stage smoke --gpu 0 --execute
-python research/rtx8000_meta/compare_baseline.py --stage pilot --gpu 0 --seed 42 --execute
+python research/rtx8000_meta/compare_baseline.py --profile original --stage smoke --gpu 0 --execute
+python research/rtx8000_meta/compare_baseline.py --profile original --stage pilot --gpu 0 --seed 42 --execute
 ```
 
 Use the remote name pointing to `benjaminW2025/slowrun` (often `origin` on

@@ -105,6 +105,8 @@ parser.add_argument("--warmdown-ratio", type=float, default=0.4)
 parser.add_argument("--total-batch-size", type=int, default=524288)
 parser.add_argument("--save-result", type=str, default="")
 parser.add_argument("--n_layer", type=int, default=16)
+parser.add_argument("--sequence-length", type=int, default=2048,
+                    help="Context length; smaller values support local controlled experiments.")
 parser.add_argument(
     "--num-iterations",
     type=int,
@@ -207,7 +209,9 @@ if args.iteration_schedule != "constant":
     if args.min_iterations > NUM_ITERATIONS:
         raise ValueError("--min-iterations must be <= --num-iterations")
 DEPTH = args.n_layer
-MAX_SEQ_LEN = 2048
+MAX_SEQ_LEN = args.sequence_length
+if MAX_SEQ_LEN < 16 or MAX_SEQ_LEN % 16:
+    raise ValueError("--sequence-length must be a positive multiple of 16, at least 16")
 WINDOW_PATTERN = "SSSL"
 TOTAL_BATCH_SIZE = args.total_batch_size
 EVAL_TOKENS = args.eval_tokens

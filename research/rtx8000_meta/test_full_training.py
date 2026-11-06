@@ -36,7 +36,7 @@ class Run:
 sys.modules['wandb'] = types.SimpleNamespace(init=lambda **kw: Run())
 tree = ast.parse(source.read_text())
 for n in tree.body:
-    if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == 'MAX_SEQ_LEN' for t in n.targets):
+    if '--sequence-length' not in sys.argv and isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == 'MAX_SEQ_LEN' for t in n.targets):
         n.value = ast.Constant(16)
 exec(compile(ast.fix_missing_locations(tree), str(source), 'exec'),
      {'__name__': '__main__', '__file__': str(source)})
@@ -68,6 +68,17 @@ class FullTrainingTests(unittest.TestCase):
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=45)
         self.assertEqual(result.returncode, 0, result.stdout)
         return result.stdout, Path(temp) / 'runs' / mode
+
+    def test_configurable_sequence_length_runs_both_controls(self):
+        with tempfile.TemporaryDirectory() as temp:
+            for mode in ('off', 'mlp'):
+                output, run = self.run_training(temp, mode, [
+                    '--sequence-length', '32', '--total-batch-size', '128'])
+                self.assertIn('seq_len=32', output)
+                report = json.loads((run / 'result.json').read_text())
+                self.assertEqual(report['arguments']['sequence_length'], 32)
+                self.assertEqual(report['effective_train_tokens'], 384)
+                self.assertTrue(torch.isfinite(torch.tensor(report['raw_final_val_loss'])))
 
     def test_all_arms_cross_recurrence_transition_and_save_finite_models(self):
         with tempfile.TemporaryDirectory() as temp:
