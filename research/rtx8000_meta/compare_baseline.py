@@ -13,6 +13,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--stage", choices=("smoke", "benchmark", "pilot", "one-pass"), default="smoke")
     parser.add_argument("--profile", choices=("medium", "small", "original"), default="medium")
+    parser.add_argument("--precision", choices=("fp16", "bf16", "fp32"), default=None,
+                        help="Defaults to BF16 for medium (L40), FP16 for older GPU profiles")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--gpu", default="0")
     parser.add_argument("--execute", action="store_true", help="Launch training; otherwise print commands only")
@@ -33,7 +35,8 @@ def main():
     if one_pass:
         eval_tokens = 1048576
     name = f"baseline-{args.profile}-{args.stage}-s{args.seed}-{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}"
-    common = ["--precision", "fp16", "--loss-scale", "128", "--no-compile",
+    precision = args.precision or ("bf16" if medium else "fp16")
+    common = ["--precision", precision, "--loss-scale", "128", "--no-compile",
               "--device-batch-size", "4" if small or medium else "1", "--virtual-ranks", "1" if small or medium else "8",
               "--total-batch-size", "8192" if small else ("32768" if medium else "524288"), "--schedule-steps", str(schedule),
               "--max-train-steps", str(steps), "--eval-tokens", str(eval_tokens),

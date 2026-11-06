@@ -25,11 +25,12 @@ class ReportingTests(unittest.TestCase):
                     autocast_ctx=nullcontext(), min_val_bpb=float('inf'), min_val_loss=float('inf'),
                     val_bpb=0, val_loss=0, model_variant='raw', ddp=False, master_process=True)
 
-    def test_fp16_rejects_cuda_failure_instead_of_cpu_fallback(self):
-        guard = next(n for n in TREE.body if isinstance(n, ast.If) and ast.unparse(n.test) == "not cuda_available and args.precision == 'fp16'")
-        with self.assertRaisesRegex(RuntimeError, 'Refusing to fall back to CPU'):
-            execute(guard, dict(cuda_available=False, args=SimpleNamespace(precision='fp16')))
-        execute(guard, dict(cuda_available=True, args=SimpleNamespace(precision='fp16')))
+    def test_mixed_precision_rejects_cuda_failure_instead_of_cpu_fallback(self):
+        guard = next(n for n in TREE.body if isinstance(n, ast.If) and ast.unparse(n.test) == "not cuda_available and args.precision in ('fp16', 'bf16')")
+        for precision in ('fp16', 'bf16'):
+            with self.assertRaisesRegex(RuntimeError, 'Refusing to fall back to CPU'):
+                execute(guard, dict(cuda_available=False, args=SimpleNamespace(precision=precision)))
+            execute(guard, dict(cuda_available=True, args=SimpleNamespace(precision=precision)))
         execute(guard, dict(cuda_available=False, args=SimpleNamespace(precision='fp32')))
 
     def test_ema_bias_correction_counts_actual_updates(self):

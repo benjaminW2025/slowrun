@@ -1,3 +1,20 @@
+# L40 numerical precision
+
+The medium profile now defaults to BF16 autocast, with FP32 model parameters,
+optimizer state, and Muon polar iteration. BF16 gradient scaling is disabled;
+`--loss-scale 128` remains an inert compatibility argument in this mode.
+Both arms always use the same precision. `--precision fp16` explicitly restores
+the old path; the small/original profiles retain their previous FP16 default.
+BF16 hardware support is checked before training. Missing or nonfinite gradients
+still abort the run; the failure now includes update, loss, precision, scale and
+recurrence stage. No failed updates are silently skipped.
+
+Restart both arms fresh after this precision change. Old FP16 results are not
+a matched control for new BF16 results. CUDA BF16 behavior needs verification
+on the actual L40; CPU regressions do not establish full GPU numerical stability.
+
+---
+
 # First development comparison: one pass per arm
 
 Use the 101,059,795-parameter medium profile, full 100M-token corpus,

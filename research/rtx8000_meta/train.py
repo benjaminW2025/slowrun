@@ -41,8 +41,8 @@ _script_start = time.time()
 parser = argparse.ArgumentParser(description="Train GPT model")
 parser.add_argument("--device-batch-size", type=int, default=4)
 parser.add_argument("--seed", type=int, default=42)
-parser.add_argument("--precision", choices=("fp16", "fp32"), default="fp16",
-                    help="RTX 8000 uses FP16 autocast with FP32 parameters; FP32 is a slow reference mode.")
+parser.add_argument("--precision", choices=("fp16", "bf16", "fp32"), default="fp16",
+                    help="FP16 for RTX 8000, BF16 for supported GPUs such as L40; parameters remain FP32.")
 parser.add_argument("--loss-scale", type=float, default=128.0,
                     help="Initial FP16 gradient scale; overflow fails fast rather than silently skipping a step.")
 parser.add_argument("--no-compile", action="store_true",
@@ -215,7 +215,7 @@ if MAX_SEQ_LEN < 16 or MAX_SEQ_LEN % 16:
 WINDOW_PATTERN = "SSSL"
 TOTAL_BATCH_SIZE = args.total_batch_size
 EVAL_TOKENS = args.eval_tokens
-ACTIVATION_DTYPE = torch.float16 if args.precision == "fp16" else torch.float32
+ACTIVATION_DTYPE = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}[args.precision]
 DATA_DIR = "fineweb_data"
 BOS_ID = 50256  # <|endoftext|>
 RUNS_DIR = "runs"
@@ -1136,9 +1136,9 @@ master_process = ddp_rank == 0
 torch.manual_seed(args.seed)
 
 cuda_available = torch.cuda.is_available()
-if not cuda_available and args.precision == "fp16":
+if not cuda_available and args.precision in ("fp16", "bf16"):
     raise RuntimeError(
-        "FP16 experiments require CUDA, but CUDA initialization failed or no GPU is visible. "
+        "Mixed-precision experiments require CUDA, but CUDA initialization failed or no GPU is visible. "
         "Refusing to fall back to CPU. Check the host/GPU allocation and test torch.cuda.init() "
         "in this same shell before relaunching."
     )
@@ -1153,12 +1153,14 @@ else:
     device = torch.device("cuda" if cuda_available else "cpu")
 
 device_type = device.type
+if args.precision == "bf16" and not torch.cuda.is_bf16_supported():
+    raise RuntimeError("BF16 requested but the selected CUDA device does not support BF16")
 print0(f"Compute device: {device}" + (f" | {torch.cuda.get_device_name(device)}" if cuda_available else " | explicit FP32 CPU reference"))
 autocast_ctx = (
     # A no-grad recurrent pass must not cache detached casts for the next,
     # differentiable pass through the same weights. Applies to training and probes.
-    torch.amp.autocast(device_type="cuda", dtype=torch.float16, cache_enabled=False)
-    if device_type == "cuda" and args.precision == "fp16" else nullcontext()
+    torch.amp.autocast(device_type="cuda", dtype=ACTIVATION_DTYPE, cache_enabled=False)
+    if device_type == "cuda" and args.precision in ("fp16", "bf16") else nullcontext()
 )
 scaler = torch.amp.GradScaler(
     "cuda", enabled=device_type == "cuda" and args.precision == "fp16",
@@ -1609,7 +1611,13 @@ while current_epoch <= args.num_epochs:
     scaler.unscale_(optimizer)
     if not math.isfinite(float(train_loss)):
         raise FloatingPointError("Nonfinite training loss; refusing to update parameters")
-    checked_parameters = validate_gradients(orig_model.named_parameters(), optimizer_parameter_ids)
+    try:
+        checked_parameters = validate_gradients(orig_model.named_parameters(), optimizer_parameter_ids)
+    except FloatingPointError as error:
+        raise FloatingPointError(
+            f"Update {step + 1}: precision={args.precision}, loss_scale={scaler.get_scale()}, "
+            f"train_loss={float(train_loss):.6f}, recurrence={active_num_iterations}. {error}"
+        ) from error
     if step == 0 or step % 50 == 0:
         print0(f"Gradient check: {checked_parameters} optimizer tensors connected and finite "
                f"| train iters: {active_num_iterations}")
