@@ -1,15 +1,54 @@
+# Default: 101M parameters on one L40
+
+The default is now `--profile medium`: **101,059,795 parameters**, verified
+by instantiating the actual GPT architecture with its padded GPT-2 vocabulary.
+Settings: 14 layers, width 512, 8 heads, context 2,048, physical batch four,
+one rank-local A/B episode, and 32,768 tokens per optimizer update.
+This is four forward/backward microbatches per update (two A, two B), rather
+than the original 256. MLP adaptation norm is 0.5, with matching settings
+between the control and meta-gradient arms. This radius is not known to be
+optimal at this scale.
+
+The full existing 100M-token training file is retained; no subset is generated
+for this profile. Pilot: 500 updates per arm and 65,536 validation tokens.
+Each arm sees 16,384,000 training-token exposures, less than one dataset pass.
+This pilot compares early learning, not repeated-data generalization. A
+longer repeated-data comparison must follow before making claims about that
+regime, and success at 101M parameters does not establish larger-scale gains.
+
+```bash
+git pull --ff-only origin codex/experiments
+python research/rtx8000_meta/compare_baseline.py --profile medium --stage benchmark --gpu 1 --execute
+```
+
+The benchmark runs eight updates per arm in two-pass recurrence, prints
+measured timings and a 500-update training-time estimate, then stops.
+Only after inspecting the timings, launch:
+
+```bash
+python research/rtx8000_meta/compare_baseline.py --profile medium --stage pilot --gpu 1 --execute
+```
+
+Runtime on the L40 is unmeasured. Initialization, optimizer compilation,
+evaluation, and shared-filesystem writes can add substantial overhead.
+Benchmark and smoke exercise two-pass recurrence immediately; the pilot
+retains the original late 1x-to-2x transition. Both arms are fresh processes
+and execute sequentially on GPU 1. Output: `runs/baseline-medium-*`.
+
+---
+
 # Small comparison on one L40
 
-The launcher now defaults to `--profile small`. Previous full-size commands
+The former small profile is available with `--profile small`. Full-size commands
 remain available only with explicit `--profile original`.
 
 From your GPU checkout after activating the training environment:
 
 ```bash
 git pull --ff-only origin codex/experiments
-python research/rtx8000_meta/compare_baseline.py --stage benchmark --gpu 1 --execute
+python research/rtx8000_meta/compare_baseline.py --profile small --stage benchmark --gpu 1 --execute
 # Inspect the measured timing and estimate before running:
-python research/rtx8000_meta/compare_baseline.py --stage pilot --gpu 1 --execute
+python research/rtx8000_meta/compare_baseline.py --profile small --stage pilot --gpu 1 --execute
 ```
 
 The benchmark runs 8 updates per arm with two recurrent passes throughout,

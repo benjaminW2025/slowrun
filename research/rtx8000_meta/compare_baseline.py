@@ -12,7 +12,7 @@ import time
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--stage", choices=("smoke", "benchmark", "pilot"), default="smoke")
-    parser.add_argument("--profile", choices=("small", "original"), default="small")
+    parser.add_argument("--profile", choices=("medium", "small", "original"), default="medium")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--gpu", default="0")
     parser.add_argument("--execute", action="store_true", help="Launch training; otherwise print commands only")
@@ -20,17 +20,21 @@ def main():
     here = Path(__file__).resolve().parent
     root = here.parents[1]
     small = args.profile == "small"
+    medium = args.profile == "medium"
     steps = {"smoke": 3, "benchmark": 8, "pilot": 200 if small else 500}[args.stage]
     schedule = 200 if small else 500
-    eval_tokens = 8192 if small else (32768 if args.stage != "pilot" else 262144)
+    eval_tokens = 8192 if small else (65536 if medium and args.stage == "pilot" else (32768 if args.stage != "pilot" else 262144))
     name = f"baseline-{args.profile}-{args.stage}-s{args.seed}-{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}"
     common = ["--precision", "fp16", "--loss-scale", "128", "--no-compile",
-              "--device-batch-size", "4" if small else "1", "--virtual-ranks", "1" if small else "8",
-              "--total-batch-size", "8192" if small else "524288", "--schedule-steps", str(schedule),
+              "--device-batch-size", "4" if small or medium else "1", "--virtual-ranks", "1" if small or medium else "8",
+              "--total-batch-size", "8192" if small else ("32768" if medium else "524288"), "--schedule-steps", str(schedule),
               "--max-train-steps", str(steps), "--eval-tokens", str(eval_tokens),
               "--seed", str(args.seed), "--mg-order", "oneway", "--mg-step-norm", "0.1" if small else "0.5",
               "--muon-weight-decay", "cautious", "--dropout", "0.1", "--probe-every", "0"]
     subset = root / "runs" / name / "train_subset.pt"
+    if medium:
+        common += ["--n_layer", "14", "--n_embd", "512", "--n_head", "8",
+                   "--sequence-length", "2048"]
     if small:
         common += ["--n_layer", "4", "--n_embd", "256", "--n_head", "4",
                    "--sequence-length", "512", "--input_bin", str(subset)]
