@@ -1352,6 +1352,9 @@ steps_per_epoch = num_train_steps / args.num_epochs
 wd_phase1_end_step = round(args.wd_phase1_epoch / args.num_epochs * num_train_steps)
 wd_phase2_end_step = round(args.wd_phase2_epoch / args.num_epochs * num_train_steps)
 print0(f"Batch size: {TOTAL_BATCH_SIZE:,} tokens, grad accum: {grad_accum_steps} steps")
+if MG and grad_accum_steps != 1:
+    raise SystemExit(f"[mg] the tiny-track meta-gradient step needs grad_accum == 1 (got {grad_accum_steps}); "
+                     f"raise --device-batch-size so device_batch_size * {MAX_SEQ_LEN} * world_size == {TOTAL_BATCH_SIZE}")
 print0(f"Training for {args.num_epochs} epoch(s) (~{num_train_steps} steps estimated)")
 if args.max_train_steps > 0:
     print0(f"Stopping after max_train_steps={args.max_train_steps:,}")
