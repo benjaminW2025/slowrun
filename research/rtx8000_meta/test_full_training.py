@@ -69,6 +69,22 @@ class FullTrainingTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout)
         return result.stdout, Path(temp) / 'runs' / mode
 
+    def test_read_only_radius_sweep_exits_without_training_or_checkpoint(self):
+        with tempfile.TemporaryDirectory() as temp:
+            _, source = self.run_training(temp, 'off')
+            output, _ = self.run_training(temp, 'off', [
+                '--init-model', str(source / 'model.pt'), '--run-name', 'sweep',
+                '--radius-sweep-pairs', '2', '--radius-sweep-radii', '0,0.1',
+                '--iteration-schedule', 'constant', '--num-iterations', '2'])
+            sweep = Path(temp) / 'runs' / 'sweep'
+            self.assertNotIn('step 00001', output)
+            self.assertFalse((sweep / 'model.pt').exists())
+            self.assertFalse((sweep / 'result.json').exists())
+            rows = [json.loads(line) for line in (sweep / 'radius_pairs.jsonl').read_text().splitlines()]
+            self.assertEqual(len(rows), 4)
+            self.assertEqual(rows[0]['b_prediction_kl'], 0)
+            self.assertTrue(all(torch.isfinite(torch.tensor(r['b_loss_change'])) for r in rows))
+
     def test_configurable_sequence_length_runs_both_controls(self):
         with tempfile.TemporaryDirectory() as temp:
             for mode in ('off', 'mlp'):

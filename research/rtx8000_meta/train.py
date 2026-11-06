@@ -59,6 +59,11 @@ parser.add_argument("--mg-mlp-step-norm", type=float, default=0.5,
                     help="Independent MLP temporary-step norm in mlp_v mode; zero disables that perturbation.")
 parser.add_argument("--mg-v-step-norm", type=float, default=0.1,
                     help="Independent V temporary-step norm in mlp_v mode; zero disables that perturbation.")
+parser.add_argument("--radius-sweep-pairs", type=int, default=0,
+                    help="Read-only checkpoint radius sweep; zero disables")
+parser.add_argument("--radius-sweep-offset", type=int, default=0)
+parser.add_argument("--radius-sweep-radii", default="0,0.03,0.1,0.3,0.5,1.0")
+parser.add_argument("--radius-sweep-config", default=None)
 parser.add_argument("--probe-every", type=int, default=0,
                     help="Read-only probes before update 1 and every N updates thereafter; 0 disables.")
 parser.add_argument("--probe-modes", type=str, default="qk,v,mlp",
@@ -158,6 +163,14 @@ parser.add_argument("--eval-tokens", type=int, default=10_000_000,
 parser.add_argument("--xsa-mode", choices=("off", "first6"), default="off",
                     help="Exclusive self-attention schedule.")
 args = parser.parse_args()
+if args.radius_sweep_pairs < 0 or args.radius_sweep_offset < 0:
+    raise ValueError("Radius sweep pair count/offset must be nonnegative")
+if args.radius_sweep_pairs:
+    if not args.init_model or not args.no_compile or args.probe_every or args.iteration_schedule != "constant":
+        raise ValueError("Radius sweep requires --init-model --no-compile, constant recurrence, and --probe-every 0")
+    sweep_radii = tuple(float(r) for r in args.radius_sweep_radii.split(','))
+    if not sweep_radii or len(set(sweep_radii)) != len(sweep_radii) or any(r < 0 or not math.isfinite(r) for r in sweep_radii):
+        raise ValueError("Sweep radii must be unique finite nonnegative numbers")
 if not 1 <= args.probe_pairs <= args.virtual_ranks:
     raise ValueError("--probe-pairs must be between 1 and --virtual-ranks")
 if args.probe_pair_offset < 0 or (args.probe_pair_offset > 0 and not (args.probe_only and args.probe_alignment_only)):
@@ -1202,7 +1215,7 @@ if master_process:
     os.makedirs(checkpoints_dir, exist_ok=True)
     os.makedirs(os.path.join(run_dir, "wandb"), exist_ok=True)
     shutil.copy2(__file__, os.path.join(run_dir, "train.py"))
-    for helper in ("virtual_rank.py", "diagnostics.py", "transfer.py"):
+    for helper in ("virtual_rank.py", "diagnostics.py", "transfer.py", "radius_sweep.py"):
         shutil.copy2(os.path.join(os.path.dirname(__file__), helper), os.path.join(run_dir, helper))
 if dist.is_initialized():
     dist.barrier()
@@ -1349,6 +1362,45 @@ if c_probe_loader is not None:
     if c_skip + args.probe_pairs * microsteps_per_half > c_probe_loader.num_steps:
         raise ValueError("C offset/pairs exceed one validation epoch; choose fewer pairs or a smaller offset")
     for _ in range(c_skip): next(c_probe_loader)
+# Standalone read-only sweep exits before schedule setup, precompilation, training or checkpoint saving.
+if args.radius_sweep_pairs:
+    import hashlib
+    import itertools
+    import subprocess
+    from radius_sweep import run_sweep
+    def sweep_hash(path):
+        digest = hashlib.sha256()
+        with open(path, 'rb') as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b''):
+                digest.update(chunk)
+        return digest.hexdigest()
+    required_batches = (args.radius_sweep_offset + args.radius_sweep_pairs) * 2 * microsteps_per_half
+    if required_batches > train_loader.num_steps:
+        raise ValueError("Requested sweep would reuse the training corpus; reduce pairs or offset")
+    sweep_params = select_trial_parameters(orig_model.named_parameters(), muon_ids, 'mlp')
+    def sweep_loss(bx, by):
+        with autocast_ctx:
+            return orig_model(bx, by, num_iterations=NUM_ITERATIONS)
+    def sweep_logits(bx):
+        with autocast_ctx:
+            return orig_model(bx, num_iterations=NUM_ITERATIONS)
+    orig_model.train()  # Retain truncated training backprop; probe context disables dropout.
+    sweep_metadata = dict(arguments=vars(args), checkpoint_sha256=sweep_hash(args.init_model),
+                          train_sha256=sweep_hash(_train_path),
+                          revision=subprocess.check_output(['git', 'rev-parse', 'HEAD'],
+                              cwd=os.path.dirname(__file__), text=True).strip(),
+                          recurrence=NUM_ITERATIONS, backprop_iterations=TRAIN_BACKPROP_ITERATIONS)
+    if args.radius_sweep_config:
+        with open(args.radius_sweep_config) as source:
+            sweep_metadata['source_training_result'] = json.load(source)
+        sweep_metadata['checkpoint_note'] = 'model_variant applies to the source final model; intermediate checkpoints may be raw'
+    run_sweep(orig_model, sweep_params, iter(itertools.chain([(x, y, current_epoch)], train_loader)),
+              sweep_loss, sweep_logits, run_dir, args.radius_sweep_pairs, args.radius_sweep_offset,
+              microsteps_per_half, sweep_radii, scaler.get_scale(), sweep_metadata)
+    wandb_run.finish()
+    sys.stdout.flush()
+    raise SystemExit(0)
+
 num_train_steps = args.schedule_steps or round(TOKENS_PER_EPOCH * args.num_epochs / TOTAL_BATCH_SIZE)
 target_iterations = args.max_train_steps if args.max_train_steps > 0 else num_train_steps
 steps_per_epoch = num_train_steps / args.num_epochs
