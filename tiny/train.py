@@ -13,6 +13,7 @@ Usage:
 """
 
 import os
+import random
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import gc
 import math
@@ -132,6 +133,14 @@ parser.add_argument("--mg-every", type=int, default=1, help="meta-gradient step 
 parser.add_argument("--mg-step-norm", type=float, default=0.5, help="L2 norm of the temporary step on the plastic matrices")
 parser.add_argument("--mg-step-schedule", type=str, default="const", choices=["const", "lr"])
 parser.add_argument("--mg-plastic", type=str, default="mlp_all", choices=["matrix_all", "mlp_all"])
+parser.add_argument("--mg-log-every", type=int, default=0,
+                    help="every N steps log cos(g_A, g_B) on the plastic matrices (rank-mean), ~SNR/(1+SNR) of the half-batch gradient; 0 = off")
+parser.add_argument("--mg-dir", type=str, default="grad", choices=["grad", "noise"],
+                    help="temporary-step direction: grad = g_A (the record); noise = g_A - EMA(g_A) (Friendly-SAM style: removes the full-gradient component)")
+parser.add_argument("--mg-ema-decay", type=float, default=0.9, help="EMA decay for --mg-dir noise (rank-local EMA of g_A on the plastic matrices)")
+parser.add_argument("--mg-sign", type=str, default="descent", choices=["descent", "ascent", "random"],
+                    help="direction of the temporary step: descent = -eta*g/|g| (the record), ascent = +eta*g/|g| (SAM-like), "
+                    "random = fair coin per (step, rank); random cancels the O(eta) lookahead term in expectation and keeps the O(eta^2) flatness term")
 args = parser.parse_args()
 
 # Resolve output path
@@ -1277,10 +1286,11 @@ if MG:
             mg_params.append(p)
             if id(p) in owned_ids:
                 mg_owned.append(len(mg_params) - 1)
-    print0(f"[mg] every {args.mg_every} steps, step norm {args.mg_step_norm} ({args.mg_step_schedule}), "
+    print0(f"[mg] every {args.mg_every} steps, step norm {args.mg_step_norm} ({args.mg_step_schedule}, sign {args.mg_sign}, dir {args.mg_dir}), "
            f"{len(mg_params)} plastic matrices, {sum(p.numel() for p in mg_params):,} parameters; "
            f"rank {ddp_rank} restores {len(mg_owned)} of them")
 mg_owned_params = [mg_params[i] for i in mg_owned]
+mg_ema, mg_ema_count = None, 0   # rank-local EMA of g_A for --mg-dir noise
 
 @torch.no_grad()
 def mg_temporary_step(step):
@@ -1288,12 +1298,39 @@ def mg_temporary_step(step):
     Returns (scaled gradient of the owned matrices, alpha) so the caller can undo the step: the Muon
     step overwrites every matrix this rank does not own with the owner's all-gathered copy, so only
     the owned matrices need restoring."""
+    global mg_ema, mg_ema_count
     grads = [p.grad if p.grad is not None else torch.zeros_like(p) for p in mg_params]
-    norm = torch.linalg.vector_norm(torch.stack(torch._foreach_norm(grads))).clamp_min(1e-12)
+    c = 0.0   # coefficient on the EMA in the direction d = g_A - c * m_hat (c = 0 -> plain g_A)
+    if args.mg_dir == "noise":
+        if mg_ema is None:
+            mg_ema = [torch.zeros_like(g) for g in grads]
+        if mg_ema_count > 0:
+            c = 1.0 / (1.0 - args.mg_ema_decay ** mg_ema_count)   # bias correction of the zero-initialised EMA
+    if c == 0.0:
+        norm = torch.linalg.vector_norm(torch.stack(torch._foreach_norm(grads))).clamp_min(1e-12)
+    else:   # ||g - c m||^2 = ||g||^2 - 2c g.m + c^2 ||m||^2, no temporary copy of the direction
+        gg = torch.stack(torch._foreach_norm(grads)).square().sum()
+        mm = torch.stack(torch._foreach_norm(mg_ema)).square().sum()
+        gm = sum((g * m).sum() for g, m in zip(grads, mg_ema))
+        norm = (gg - 2 * c * gm + c * c * mm).clamp_min(0).sqrt().clamp_min(1e-12)
     eta = args.mg_step_norm * (get_lr_multiplier(step) if args.mg_step_schedule == "lr" else 1.0)
-    alpha = -eta / float(norm)
-    kept = [grads[i].clone() for i in mg_owned]
-    torch._foreach_add_(mg_params, grads, alpha=alpha)
+    if args.mg_sign == "descent":
+        sign = 1.0
+    elif args.mg_sign == "ascent":
+        sign = -1.0
+    else:   # deterministic fair coin per (seed, step, rank); restore uses the returned alpha, so undo is exact
+        sign = 1.0 if random.Random(args.seed * 10_000_019 + step * 1_009 + ddp_rank).random() < 0.5 else -1.0
+    alpha = -sign * eta / float(norm)
+    if c == 0.0:
+        kept = [grads[i].clone() for i in mg_owned]
+        torch._foreach_add_(mg_params, grads, alpha=alpha)
+    else:
+        kept = [grads[i] - c * mg_ema[i] for i in mg_owned]   # the applied direction, so the caller's undo is exact
+        torch._foreach_add_(mg_params, grads, alpha=alpha)
+        torch._foreach_add_(mg_params, mg_ema, alpha=-alpha * c)
+    if args.mg_dir == "noise":   # update the EMA with this step's g_A (after the direction is formed; restore uses `kept`)
+        torch._foreach_lerp_(mg_ema, grads, 1.0 - args.mg_ema_decay)
+        mg_ema_count += 1
     return kept, alpha
 
 # Dataloaders
@@ -1460,14 +1497,32 @@ while current_epoch <= args.num_epochs:
         with autocast_ctx:
             loss = model(x[:half], y[:half], num_iterations=active_num_iterations, mtp_weights=mtp_w).mean()
         (loss * 0.5).backward()
+        mg_log = args.mg_log_every > 0 and step % args.mg_log_every == 0
+        if mg_log:   # snapshot g_A on all plastic matrices (p.grad is still rank-local: the reduction happens in optimizer.step)
+            with torch.no_grad():
+                mg_gA = [p.grad.detach().float().clone() if p.grad is not None else torch.zeros_like(p, dtype=torch.float32) for p in mg_params]
         mg_kept, mg_alpha = mg_temporary_step(step)
         with autocast_ctx:
             loss_q = model(x[half:], y[half:], num_iterations=active_num_iterations, mtp_weights=mtp_w).mean()
         (loss_q * 0.5).backward()
+        if mg_log:   # g_B (at theta') = accumulated grad - g_A; the 0.5 scales cancel in the cosine
+            with torch.no_grad():
+                dot = torch.zeros((), device=device); nA = torch.zeros((), device=device); nB = torch.zeros((), device=device)
+                for p, gA in zip(mg_params, mg_gA):
+                    gB = (p.grad.float() if p.grad is not None else torch.zeros_like(gA)) - gA
+                    dot += (gA * gB).sum(); nA += gA.square().sum(); nB += gB.square().sum()
+                cos = dot / (nA.sqrt() * nB.sqrt()).clamp_min(1e-30)
+                stats = torch.stack([cos, nA.sqrt(), nB.sqrt()])
+                if ddp:
+                    dist.all_reduce(stats, op=dist.ReduceOp.AVG)
+                print0(f"[mg-snr] step {step} | cos(gA,gB) {stats[0].item():.5f} | |gA| {stats[1].item():.4e} | |gB| {stats[2].item():.4e} | sign {mg_alpha < 0 and '+desc' or '-asc'}")
+            del mg_gA
         with torch.no_grad():
             torch._foreach_add_(mg_owned_params, mg_kept, alpha=-mg_alpha)   # restore the owned matrices
         del mg_kept
-        train_loss = 0.5 * (loss.detach() + loss_q.detach())
+        # log only the unperturbed half (at theta): loss_q is taken at the moved point and is biased by the
+        # temporary step (low for descent, high for ascent), which would confound train-loss comparisons
+        train_loss = loss.detach()
         x, y, epoch = next(train_loader)
     else:
         for micro_step in range(grad_accum_steps):
