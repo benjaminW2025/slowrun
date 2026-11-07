@@ -15,6 +15,7 @@ Checks (fp32, no autocast, against hand-written references):
 import argparse
 import copy
 import json
+import math
 import os
 import random
 import sys
@@ -256,6 +257,44 @@ for comp in compiles:
         else:
             ok = ok and signs == ({1.0} if mode == "descent" else {-1.0})
         check(f"main --mg {mode} --compile {comp}", ok, f"(val {[round(v, 3) for v in h]}, cos signs {sorted(signs)})")
+
+print("8. eta schedules: explicit eta, adaptive controller, lr / adaptive / const end to end")
+g_e, _, _ = run_compute(model, make_cfg(mg="descent"), xb, yb)
+proxy_params, proxy_plastic = list(model.parameters()), proxy.plastic_params(model, "mlp")
+proxy.compute_grad(model, proxy_params, proxy_plastic, xb, yb, make_cfg(mg="descent", mg_step_norm=0.9), random.Random(0), eta=0.25)
+g_eta = grads(model)
+refs = [reference_group_grad(model, xb[i * gs:(i + 1) * gs], yb[i * gs:(i + 1) * gs], 1.0, 0.25, plastic_names) for i in range(G)]
+g_ref = [sum(r[0][j] for r in refs) / G for j in range(len(g_eta))]
+check("compute_grad(eta=0.25) == reference at 0.25 (overrides cfg.mg_step_norm)", maxdiff(g_eta, g_ref) < 1e-9 * max(1.0, scale(g_ref)),
+      f"(max diff {maxdiff(g_eta, g_ref):.2e})")
+c = make_cfg(mg_step_norm=0.5, mg_cos_target=0.02, mg_adapt_rate=0.5, mg_eta_min=0.005)
+check("adapt_eta shrinks when cos < target", proxy.adapt_eta(0.3, -0.1, c) < 0.3)
+check("adapt_eta grows when cos > target", proxy.adapt_eta(0.3, 0.2, c) > 0.3)
+check("adapt_eta unchanged at target", abs(proxy.adapt_eta(0.3, 0.02, c) - 0.3) < 1e-15)
+check("adapt_eta capped at --mg-step-norm", proxy.adapt_eta(0.5, 0.9, c) == 0.5)
+check("adapt_eta floored at --mg-eta-min", proxy.adapt_eta(0.005, -0.9, c) == 0.005)
+check("adapt_eta step size: exp(0.5 * (-0.1 - 0.02))", abs(proxy.adapt_eta(0.3, -0.1, c) - 0.3 * math.exp(0.5 * -0.12)) < 1e-12)
+for sched in ["const", "lr", "adaptive"]:
+    out = os.path.join(tmp, f"sched_{sched}")
+    proxy.main(common + ["--mg", "descent", "--compile", "0", "--mg-eta-schedule", sched, "--out", out])
+    r = json.load(open(os.path.join(out, "result.json")))
+    eh, total = r["eta_hist"], r["total_steps"]
+    cfg_r = proxy.get_args(common + ["--mg-eta-schedule", sched])
+    ok = len(eh) == len(r["history"]["step"]) and False or len(eh) > 0
+    if sched == "const":
+        ok = all(e == 0.5 for e in eh)
+        detail = f"(all {eh[0]})"
+    elif sched == "lr":
+        ok = all(abs(e - 0.5 * proxy.lr_multiplier(i, total, cfg_r)) < 1e-12 for i, e in enumerate(eh))
+        detail = f"(first {eh[0]:.4f}, mid {eh[len(eh) // 2]:.4f}, last {eh[-1]:.4f})"
+    else:
+        ok = eh[0] == 0.5 and all(0.005 <= e <= 0.5 for e in eh) and len(set(eh)) > 1
+        detail = f"(first {eh[0]:.4f}, min {min(eh):.4f}, last {eh[-1]:.4f}, mean {r['eta_mean']:.4f})"
+    ok = ok and math.isfinite(r["final_val"])
+    check(f"main --mg-eta-schedule {sched}", ok, detail)
+    if sched == "const":
+        check("const schedule reproduces the default descent run exactly", r["history"]["val"] ==
+              json.load(open(os.path.join(tmp, "descent_c0", "result.json")))["history"]["val"])
 
 if not targs.skip_compile:
     compile_test()

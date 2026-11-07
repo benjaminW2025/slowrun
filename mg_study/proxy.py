@@ -60,6 +60,12 @@ def get_args(argv=None):
     p.add_argument("--mg-groups", type=int, default=8, help="emulated ranks: each group pairs its own halves")
     p.add_argument("--mg-plastic", default="mlp", choices=["mlp", "matrix"])
     p.add_argument("--mg-log-every", type=int, default=25, help="log cos(g_A, g_B(theta')) every N steps (0 = off)")
+    p.add_argument("--mg-eta-schedule", default="const", choices=["const", "lr", "adaptive"],
+                   help="const: eta = --mg-step-norm; lr: --mg-step-norm x LR multiplier; adaptive: start at "
+                        "--mg-step-norm and shrink eta whenever the measured cos(g_A, g_B(theta')) falls below --mg-cos-target")
+    p.add_argument("--mg-cos-target", type=float, default=0.02, help="adaptive: target group-mean cosine")
+    p.add_argument("--mg-adapt-rate", type=float, default=0.5, help="adaptive: log(eta) += rate * (cos - target) per step")
+    p.add_argument("--mg-eta-min", type=float, default=0.005, help="adaptive: lower bound on eta (upper bound = --mg-step-norm)")
     # run
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--eval-every", type=int, default=250)
@@ -210,7 +216,7 @@ def step_sign(mode, rng):
     return 1.0 if rng.random() < 0.5 else -1.0
 
 
-def compute_grad(model, params, plastic, xb, yb, cfg, rng, log_cos=False):
+def compute_grad(model, params, plastic, xb, yb, cfg, rng, log_cos=False, eta=None):
     """Fill p.grad (for every p in params) with the gradient the optimizer receives.
 
     The batch is split into cfg.mg_groups groups; each group's first half A gives a temporary step
@@ -218,6 +224,7 @@ def compute_grad(model, params, plastic, xb, yb, cfg, rng, log_cos=False):
     is evaluated at that point, the step is undone (exact copy-back). The result is the mean over all
     2 * groups half-batch gradients, i.e. for --mg off exactly the ordinary full-batch mean gradient.
     Returns (mean unperturbed train loss over the A halves, list of (sign, cos) per group)."""
+    eta = cfg.mg_step_norm if eta is None else eta
     G = cfg.mg_groups
     B = xb.size(0)
     assert B % (2 * G) == 0, f"batch {B} must be divisible by 2*mg_groups={2 * G}"
@@ -249,7 +256,7 @@ def compute_grad(model, params, plastic, xb, yb, cfg, rng, log_cos=False):
                     if k > 0:
                         for p, sv in zip(plastic, saved):
                             p.copy_(sv)
-                    alpha = (-sign * cfg.mg_step_norm / norm).to(gA[0].dtype)
+                    alpha = (-sign * eta / norm).to(gA[0].dtype)
                     for p, g in zip(plastic, gA):
                         p.add_(g * alpha)
                     pre = [up(p.grad).clone() for p in plastic] if log_cos else None
@@ -273,6 +280,22 @@ def compute_grad(model, params, plastic, xb, yb, cfg, rng, log_cos=False):
     for a, p in zip(acc, params):
         p.grad = a.div_(2 * G)
     return float(lossA_sum) / G, cos_log
+
+
+def lr_multiplier(s, total_steps, cfg):
+    w, d = max(1, int(cfg.warmup_frac * total_steps)), int(cfg.warmdown_frac * total_steps)
+    if s < w:
+        return (s + 1) / w
+    if s >= total_steps - d:
+        return max(0.0, (total_steps - s) / max(d, 1))
+    return 1.0
+
+
+def adapt_eta(eta, mean_cos, cfg):
+    """Multiplicative controller: eta grows when the cosine is above target, shrinks when below,
+    clipped to [--mg-eta-min, --mg-step-norm]."""
+    eta = eta * math.exp(cfg.mg_adapt_rate * (mean_cos - cfg.mg_cos_target))
+    return min(cfg.mg_step_norm, max(cfg.mg_eta_min, eta))
 
 
 # ----------------------------------------------------------------------------- eval
@@ -344,16 +367,14 @@ def main(argv=None):
         f"(|theta_P|={plastic_norm:.2f}, step/|theta_P|={cfg.mg_step_norm / plastic_norm:.4f})")
     log(f"[proxy] train {n_train:,} seqs x {cfg.seq_len} ({n_train * cfg.seq_len:,} tok), {steps_per_epoch} steps/epoch, "
         f"{total_steps} total steps ({cfg.epochs} epochs), running {run_steps}; micro-batch {micro} seqs; "
-        f"mg={cfg.mg} groups={cfg.mg_groups} step_norm={cfg.mg_step_norm} plastic={cfg.mg_plastic}")
+        f"mg={cfg.mg} groups={cfg.mg_groups} step_norm={cfg.mg_step_norm} eta_schedule={cfg.mg_eta_schedule} plastic={cfg.mg_plastic}")
     log(f"[proxy] config {json.dumps(vars(cfg))}")
 
     def lr_mult(s):
-        w, d = max(1, int(cfg.warmup_frac * total_steps)), int(cfg.warmdown_frac * total_steps)
-        if s < w:
-            return (s + 1) / w
-        if s >= total_steps - d:
-            return max(0.0, (total_steps - s) / max(d, 1))
-        return 1.0
+        return lr_multiplier(s, total_steps, cfg)
+
+    adaptive = cfg.mg != "off" and cfg.mg_eta_schedule == "adaptive"
+    eta_state, eta_hist = cfg.mg_step_norm, []
 
     hist = {"step": [], "val": [], "train_eval": []}
     cos_hist = []   # (step, sign, cos)
@@ -366,10 +387,21 @@ def main(argv=None):
             order, ptr = torch.randperm(n_train, generator=g), 0
         batch = train_seqs[order[ptr: ptr + cfg.batch_seqs]].to(device, non_blocking=True).long()
         ptr += cfg.batch_seqs
-        log_cos = cfg.mg != "off" and cfg.mg_log_every > 0 and step % cfg.mg_log_every == 0
-        with autocast():
-            train_loss, cos_log = compute_grad(fwd, params, plastic, batch[:, :-1], batch[:, 1:], cfg, sign_rng, log_cos)
+        record_cos = cfg.mg != "off" and cfg.mg_log_every > 0 and step % cfg.mg_log_every == 0
         m = lr_mult(step)
+        if cfg.mg_eta_schedule == "lr":
+            eta_now = cfg.mg_step_norm * m
+        elif adaptive:
+            eta_now = eta_state
+        else:
+            eta_now = cfg.mg_step_norm
+        eta_hist.append(eta_now)
+        with autocast():
+            train_loss, cos_all = compute_grad(fwd, params, plastic, batch[:, :-1], batch[:, 1:], cfg, sign_rng,
+                                               record_cos or adaptive, eta=eta_now)
+        if adaptive and cos_all:
+            eta_state = adapt_eta(eta_state, sum(c for _, c in cos_all) / len(cos_all), cfg)
+        cos_log = cos_all if record_cos else []
         for gr in adam.param_groups:
             gr["lr"] = cfg.adam_lr * m
         muon.step(m)
@@ -388,7 +420,7 @@ def main(argv=None):
             el = time.time() - t0
             mem = torch.cuda.max_memory_allocated() / 2**30 if device.type == "cuda" else 0.0
             eta = el / (step + 1) * (run_steps - step - 1) / 60
-            log(f"step {step:05d}/{run_steps} ep {epoch} | train {train_loss:.4f} | lr x{m:.3f} | "
+            log(f"step {step:05d}/{run_steps} ep {epoch} | train {train_loss:.4f} | lr x{m:.3f} | mg eta {eta_now:.4f} | "
                 f"{tokens_done / el:,.0f} tok/s | mem {mem:.1f}GB | eta {eta:.1f}m")
         if (step + 1) % cfg.eval_every == 0 or step == run_steps - 1:
             v = evaluate(fwd, val_seqs, micro, device, autocast)
@@ -404,6 +436,7 @@ def main(argv=None):
         "config": vars(cfg), "steps_run": len(hist["step"]) and hist["step"][-1], "total_steps": total_steps,
         "final_val": hist["val"][-1], "best_val": best_val, "final_train_eval": hist["train_eval"][-1],
         "final_gap": hist["val"][-1] - hist["train_eval"][-1], "history": hist, "mg_cos": cos_hist,
+        "eta_hist": eta_hist, "eta_mean": sum(eta_hist) / max(len(eta_hist), 1),
         "minutes": (time.time() - t0) / 60, "tok_per_s": tokens_done / (time.time() - t0),
         "peak_mem_gb": torch.cuda.max_memory_allocated() / 2**30 if device.type == "cuda" else 0.0,
         "plastic_norm_init": plastic_norm,
