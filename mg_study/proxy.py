@@ -12,6 +12,7 @@ PyTorch re-implementation of the parts that matter for the mechanism question, s
     group does its own split pairing (first half adapts, second half is evaluated at the adapted
     point, the step is undone), exactly like one rank of the record
   * --mg off | descent (the record) | ascent | random (fair coin per (step, group))
+    | even (antithetic: B evaluated at both theta -/+ eta*v, averaged; ~1.5x compute)
 
 Outputs <out>/result.json and <out>/log.txt. See mg_study/README_proxy.md.
 """
@@ -53,7 +54,8 @@ def get_args(argv=None):
     p.add_argument("--warmup-frac", type=float, default=0.02)
     p.add_argument("--warmdown-frac", type=float, default=0.4)
     # meta-gradient
-    p.add_argument("--mg", default="descent", choices=["off", "descent", "ascent", "random"])
+    p.add_argument("--mg", default="descent", choices=["off", "descent", "ascent", "random", "even"],
+                   help="even = antithetic: B at theta -/+ eta*v averaged (exact even part, ~1.5x compute)")
     p.add_argument("--mg-step-norm", type=float, default=0.5, help="L2 norm of the temporary step on the plastic matrices")
     p.add_argument("--mg-groups", type=int, default=8, help="emulated ranks: each group pairs its own halves")
     p.add_argument("--mg-plastic", default="mlp", choices=["mlp", "matrix"])
@@ -233,27 +235,37 @@ def compute_grad(model, params, plastic, xb, yb, cfg, rng, log_cos=False):
         if cfg.mg == "off":
             model(xq, yq).backward()
         else:
+            # descent / ascent / random: one evaluation of B at theta - sign*eta*v.
+            # even: B at both theta - eta*v and theta + eta*v, each weighted 1/2 (antithetic): the
+            # update is then exactly the even-in-eta part on every step (odd orders cancel within the step).
+            signs = [1.0, -1.0] if cfg.mg == "even" else [step_sign(cfg.mg, rng)]
+            w = 1.0 / len(signs)
             with torch.no_grad():
-                gA = [p.grad for p in plastic]
+                gA = [p.grad.detach().clone() for p in plastic]   # clone: autograd accumulates into p.grad in place
                 norm = torch.sqrt(sum(up(g).pow(2).sum() for g in gA)).clamp_min(1e-12)
-                sign = step_sign(cfg.mg, rng)
                 saved = [p.detach().clone() for p in plastic]
-                gA_snap = [g.detach().clone() for g in gA] if log_cos else None
-                alpha = (-sign * cfg.mg_step_norm / norm).to(gA[0].dtype)
-                for p, g in zip(plastic, gA):
-                    p.add_(g * alpha)
-            model(xq, yq).backward()
-            with torch.no_grad():
-                for p, s in zip(plastic, saved):
-                    p.copy_(s)
+            for k, sign in enumerate(signs):
+                with torch.no_grad():
+                    if k > 0:
+                        for p, sv in zip(plastic, saved):
+                            p.copy_(sv)
+                    alpha = (-sign * cfg.mg_step_norm / norm).to(gA[0].dtype)
+                    for p, g in zip(plastic, gA):
+                        p.add_(g * alpha)
+                    pre = [up(p.grad).clone() for p in plastic] if log_cos else None
+                (model(xq, yq) * w).backward()
                 if log_cos:
-                    dot = nA = nB = 0.0
-                    for p, ga in zip(plastic, gA_snap):
-                        gb = up(p.grad) - up(ga)
-                        dot = dot + (up(ga) * gb).sum()
-                        nA = nA + up(ga).pow(2).sum()
-                        nB = nB + gb.pow(2).sum()
-                    cos_log.append((sign, float(dot / (nA.sqrt() * nB.sqrt()).clamp_min(1e-30))))
+                    with torch.no_grad():
+                        dot = nA = nB = 0.0
+                        for p, ga, pr in zip(plastic, gA, pre):
+                            gb = (up(p.grad) - pr) / w
+                            dot = dot + (up(ga) * gb).sum()
+                            nA = nA + up(ga).pow(2).sum()
+                            nB = nB + gb.pow(2).sum()
+                        cos_log.append((sign, float(dot / (nA.sqrt() * nB.sqrt()).clamp_min(1e-30))))
+            with torch.no_grad():
+                for p, sv in zip(plastic, saved):
+                    p.copy_(sv)
         with torch.no_grad():
             for a, p in zip(acc, params):
                 if p.grad is not None:

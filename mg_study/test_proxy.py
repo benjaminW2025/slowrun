@@ -194,6 +194,21 @@ for trial in range(4):
     check(f"random trial {trial} (signs {gsigns}) == reference", maxdiff(g_mg, g_ref) < 1e-9 * max(1.0, scale(g_ref)) and
           [s for s, _ in cos] == gsigns, f"(max diff {maxdiff(g_mg, g_ref):.2e})")
 
+print("4b. even (antithetic) == average of the descent and ascent references")
+before = [p.detach().clone() for p in model.parameters()]
+g_ev, _, cos = run_compute(model, make_cfg(mg="even"), xb, yb, log_cos=True)
+check("even: params bitwise unchanged", all(torch.equal(a, p) for a, p in zip(before, model.parameters())))
+refs_p = [reference_group_grad(model, xb[i * gs:(i + 1) * gs], yb[i * gs:(i + 1) * gs], 1.0, 0.5, plastic_names) for i in range(G)]
+refs_m = [reference_group_grad(model, xb[i * gs:(i + 1) * gs], yb[i * gs:(i + 1) * gs], -1.0, 0.5, plastic_names) for i in range(G)]
+g_ref = [sum(0.5 * (rp[0][j] + rm[0][j]) for rp, rm in zip(refs_p, refs_m)) / G for j in range(len(g_ev))]
+check("even == (descent_ref + ascent_ref)/2", maxdiff(g_ev, g_ref) < 1e-9 * max(1.0, scale(g_ref)), f"(max diff {maxdiff(g_ev, g_ref):.2e})")
+cref = [c for rp, rm in zip(refs_p, refs_m) for c in (rp[1], rm[1])]
+check("even logs both signs per group, cos == reference",
+      [s_ for s_, _ in cos] == [1.0, -1.0] * G and all(abs(c - r) < 1e-9 for (_, c), r in zip(cos, cref)),
+      f"(logged {[round(c, 5) for _, c in cos]} ref {[round(c, 5) for c in cref]})")
+g_d, _, _ = run_compute(model, make_cfg(mg="descent"), xb, yb)
+check("even differs from descent and from off", maxdiff(g_ev, g_d) > 1e-6 and maxdiff(g_ev, g_full) > 1e-6)
+
 print("5. matrix plastic set + more groups")
 cfg = make_cfg(mg="descent", mg_plastic="matrix", mg_groups=4)
 g_mg, _, _ = run_compute(model, cfg, xb, yb)
@@ -225,7 +240,7 @@ common = ["--data-dir", data_dir, "--train-tokens", "260000", "--val-tokens", "5
           "--epochs", "1", "--eval-every", "40", "--log-every", "40", "--mg-log-every", "10", "--device", str(DEV)]
 compiles = ["0"] if targs.skip_compile else ["0", "1"]
 for comp in compiles:
-    for mode in ["off", "descent", "random", "ascent"]:
+    for mode in ["off", "descent", "random", "ascent", "even"]:
         out = os.path.join(tmp, f"{mode}_c{comp}")
         res = proxy.main(common + ["--mg", mode, "--compile", comp, "--out", out])
         with open(os.path.join(out, "result.json")) as f:
@@ -236,7 +251,7 @@ for comp in compiles:
         signs = {s for _, s, _ in res2["mg_cos"]}
         if mode == "off":
             ok = ok and len(res2["mg_cos"]) == 0
-        elif mode == "random":
+        elif mode in ("random", "even"):
             ok = ok and signs == {1.0, -1.0}
         else:
             ok = ok and signs == ({1.0} if mode == "descent" else {-1.0})
