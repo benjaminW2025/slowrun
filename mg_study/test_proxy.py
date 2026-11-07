@@ -28,6 +28,7 @@ import proxy  # noqa: E402
 ap = argparse.ArgumentParser()
 ap.add_argument("--device", default="auto")
 ap.add_argument("--skip-compile", action="store_true")
+ap.add_argument("--only-compile", action="store_true", help="run only test 7 (torch.compile)")
 targs = ap.parse_args()
 DEV = torch.device("cuda" if (targs.device == "auto" and torch.cuda.is_available()) else
                    ("cpu" if targs.device == "auto" else targs.device))
@@ -103,6 +104,47 @@ def run_compute(model, cfg, xb, yb, rng=None, log_cos=False):
     plastic = proxy.plastic_params(model, cfg.mg_plastic)
     loss, cos = proxy.compute_grad(model, params, plastic, xb, yb, cfg, rng or random.Random(0), log_cos)
     return grads(model), loss, cos
+
+
+def compile_test():
+    """7. torch.compile must use the temporarily moved weights. Compiled and eager kernels differ by
+    float rounding (reduction order, fused kernels), so the reference is that noise floor measured on
+    --mg off, where MG plays no part. Checks: (a) compiled vs eager differ no more for descent than for
+    off, i.e. MG adds no compile-specific error; (b) the MG effect (descent - off) is the same compiled
+    and eager; (c) compiled descent is far from compiled off, i.e. the step is not ignored."""
+    print("7. torch.compile sees the temporary step (params are graph inputs, not baked-in constants)")
+    torch.manual_seed(0)
+    m32 = proxy.GPT(50257, 64, 2, 4, 32, 0.0).to(DEV)
+    xb32, yb32 = batch(seed=7)
+    params, plastic = list(m32.parameters()), proxy.plastic_params(m32, "mlp")
+    mc = torch.compile(m32, dynamic=False)
+
+    def g_of(model, mode):
+        proxy.compute_grad(model, params, plastic, xb32, yb32, make_cfg(mg=mode), random.Random(0))
+        return grads(m32)
+
+    e_off, e_desc = g_of(m32, "off"), g_of(m32, "descent")
+    s = scale(e_desc)
+    for rep in range(2):   # twice: the second call runs the cached graph
+        c_off, c_desc = g_of(mc, "off"), g_of(mc, "descent")
+        floor = maxdiff(c_off, e_off) / s
+        err = maxdiff(c_desc, e_desc) / s
+        check(f"(a) call {rep + 1}: compiled-vs-eager error for descent within 10x the off noise floor",
+              err <= max(10 * floor, 1e-5), f"(descent {err:.2e}, off floor {floor:.2e})")
+        eff_e = [d - o for d, o in zip(e_desc, e_off)]
+        eff_c = [d - o for d, o in zip(c_desc, c_off)]
+        rel_eff = maxdiff(eff_c, eff_e) / scale(eff_e)
+        check(f"(b) call {rep + 1}: MG effect (descent - off) same compiled and eager", rel_eff < 0.02,
+              f"(rel diff {rel_eff:.2e} of the effect size {scale(eff_e) / s:.2e})")
+    step = maxdiff(c_desc, c_off) / s
+    check("(c) compiled descent != compiled off (the step is not ignored)", step > 100 * max(floor, 1e-7),
+          f"(descent-off {step:.2e} vs noise floor {floor:.2e})")
+
+
+if targs.only_compile:
+    compile_test()
+    print("\n" + (f"{len(FAILS)} FAILED: {FAILS}" if FAILS else "ALL TESTS PASSED"))
+    sys.exit(1 if FAILS else 0)
 
 
 xb, yb = batch()
@@ -201,25 +243,7 @@ for comp in compiles:
         check(f"main --mg {mode} --compile {comp}", ok, f"(val {[round(v, 3) for v in h]}, cos signs {sorted(signs)})")
 
 if not targs.skip_compile:
-    print("7. torch.compile sees the temporary step (params are graph inputs, not baked-in constants)")
-    torch.manual_seed(0)
-    m32 = proxy.GPT(50257, 64, 2, 4, 32, 0.0).to(DEV)
-    xb32, yb32 = batch(seed=7)
-    cfg = make_cfg(mg="descent")
-    params, plastic = list(m32.parameters()), proxy.plastic_params(m32, "mlp")
-    proxy.compute_grad(m32, params, plastic, xb32, yb32, cfg, random.Random(0))
-    g_eager = grads(m32)
-    mc = torch.compile(m32, dynamic=False)
-    for rep in range(2):   # twice: the second call runs the cached graph
-        proxy.compute_grad(mc, params, plastic, xb32, yb32, cfg, random.Random(0))
-        g_comp = grads(m32)
-        rel = maxdiff(g_comp, g_eager) / scale(g_eager)
-        check(f"compiled descent == eager descent (call {rep + 1})", rel < 1e-4, f"(rel diff {rel:.2e})")
-    cfg_off = make_cfg(mg="off")
-    proxy.compute_grad(mc, params, plastic, xb32, yb32, cfg_off, random.Random(0))
-    g_off_c = grads(m32)
-    check("compiled descent != compiled off (the step is not ignored)", maxdiff(g_comp, g_off_c) / scale(g_eager) > 1e-3,
-          f"(rel diff {maxdiff(g_comp, g_off_c) / scale(g_eager):.2e})")
+    compile_test()
 
 print()
 if FAILS:
