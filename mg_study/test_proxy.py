@@ -210,6 +210,29 @@ check("even logs both signs per group, cos == reference",
 g_d, _, _ = run_compute(model, make_cfg(mg="descent"), xb, yb)
 check("even differs from descent and from off", maxdiff(g_ev, g_d) > 1e-6 and maxdiff(g_ev, g_full) > 1e-6)
 
+print("4c. knobs: (1,1) == descent, (0,1) == even, (0,0) == off, (2,4) == weighted references")
+g_desc, _, _ = run_compute(model, make_cfg(mg="descent"), xb, yb)
+g_even, _, _ = run_compute(model, make_cfg(mg="even"), xb, yb)
+for (al, be, target, name) in [(1.0, 1.0, g_desc, "descent"), (0.0, 1.0, g_even, "even"), (0.0, 0.0, g_full, "off")]:
+    before = [p.detach().clone() for p in model.parameters()]
+    g_k, _, _ = run_compute(model, make_cfg(mg="knobs", mg_alpha=al, mg_beta=be), xb, yb, log_cos=True)
+    check(f"knobs({al:g},{be:g}) == {name}", maxdiff(g_k, target) < 1e-9 * max(1.0, scale(target)), f"(max diff {maxdiff(g_k, target):.2e})")
+    check(f"knobs({al:g},{be:g}) params bitwise unchanged", all(torch.equal(a_, p) for a_, p in zip(before, model.parameters())))
+al, be = 2.0, 4.0
+g_k, _, cos_k = run_compute(model, make_cfg(mg="knobs", mg_alpha=al, mg_beta=be), xb, yb, log_cos=True)
+gref = None
+for i in range(G):
+    sl = slice(i * gs, (i + 1) * gs)
+    r0 = reference_group_grad(model, xb[sl], yb[sl], 1.0, 0.0, plastic_names)[0]
+    rp = reference_group_grad(model, xb[sl], yb[sl], 1.0, 0.5, plastic_names)[0]
+    rm = reference_group_grad(model, xb[sl], yb[sl], -1.0, 0.5, plastic_names)[0]
+    gi = [(1 - be) * a0 + (be + al) / 2 * ap_ + (be - al) / 2 * am for a0, ap_, am in zip(r0, rp, rm)]
+    gref = gi if gref is None else [x + y for x, y in zip(gref, gi)]
+gref = [x / G for x in gref]
+check("knobs(2,4) == (1-b) ref(0) + (b+a)/2 ref(+) + (b-a)/2 ref(-)", maxdiff(g_k, gref) < 1e-9 * max(1.0, scale(gref)),
+      f"(max diff {maxdiff(g_k, gref):.2e})")
+check("knobs logs cos for the +/- probes only", sorted({s_ for s_, _ in cos_k}) == [-1.0, 1.0] and len(cos_k) == 2 * G)
+
 print("5. matrix plastic set + more groups")
 cfg = make_cfg(mg="descent", mg_plastic="matrix", mg_groups=4)
 g_mg, _, _ = run_compute(model, cfg, xb, yb)

@@ -54,8 +54,11 @@ def get_args(argv=None):
     p.add_argument("--warmup-frac", type=float, default=0.02)
     p.add_argument("--warmdown-frac", type=float, default=0.4)
     # meta-gradient
-    p.add_argument("--mg", default="descent", choices=["off", "descent", "ascent", "random", "even"],
-                   help="even = antithetic: B at theta -/+ eta*v averaged (exact even part, ~1.5x compute)")
+    p.add_argument("--mg", default="descent", choices=["off", "descent", "ascent", "random", "even", "knobs"],
+                   help="even = antithetic: B at theta -/+ eta*v averaged (exact even part, ~1.5x compute); "
+                        "knobs = B-term f(0) + alpha*O + beta*E with probe size eta (see --mg-alpha/--mg-beta, ~2x compute)")
+    p.add_argument("--mg-alpha", type=float, default=1.0, help="knobs: weight on the odd (Hessian) part O = (f(eta) - f(-eta))/2")
+    p.add_argument("--mg-beta", type=float, default=1.0, help="knobs: weight on the even (third-derivative) part E = (f(eta) + f(-eta))/2 - f(0)")
     p.add_argument("--mg-step-norm", type=float, default=0.5, help="L2 norm of the temporary step on the plastic matrices")
     p.add_argument("--mg-groups", type=int, default=8, help="emulated ranks: each group pairs its own halves")
     p.add_argument("--mg-plastic", default="mlp", choices=["mlp", "matrix"])
@@ -73,6 +76,7 @@ def get_args(argv=None):
     p.add_argument("--compile", type=int, default=1)
     p.add_argument("--device", default="auto")
     p.add_argument("--out", default=None, help="output dir (default runs_proxy/<mg>_s<seed>)")
+    p.add_argument("--save-model", default="", help="save the final state_dict here (used by probe_precision.py)")
     return p.parse_args(argv)
 
 
@@ -245,13 +249,21 @@ def compute_grad(model, params, plastic, xb, yb, cfg, rng, log_cos=False, eta=No
             # descent / ascent / random: one evaluation of B at theta - sign*eta*v.
             # even: B at both theta - eta*v and theta + eta*v, each weighted 1/2 (antithetic): the
             # update is then exactly the even-in-eta part on every step (odd orders cancel within the step).
-            signs = [1.0, -1.0] if cfg.mg == "even" else [step_sign(cfg.mg, rng)]
-            w = 1.0 / len(signs)
+            # passes = (sign, weight): B's gradient at theta - sign*eta*v enters with that weight (sign 0 = theta).
+            # knobs: with f(t) = grad L_B(theta - t v), f(0) + a*O + b*E = (1-b) f(0) + (b+a)/2 f(eta) + (b-a)/2 f(-eta);
+            # a = b = 1 is descent, a = 0, b = 1 is even, a = b = 0 is off. Zero-weight passes are skipped.
+            if cfg.mg == "even":
+                passes = [(1.0, 0.5), (-1.0, 0.5)]
+            elif cfg.mg == "knobs":
+                a_, b_ = cfg.mg_alpha, cfg.mg_beta
+                passes = [(s_, w_) for s_, w_ in [(0.0, 1.0 - b_), (1.0, (b_ + a_) / 2), (-1.0, (b_ - a_) / 2)] if w_ != 0.0]
+            else:
+                passes = [(step_sign(cfg.mg, rng), 1.0)]
             with torch.no_grad():
                 gA = [p.grad.detach().clone() for p in plastic]   # clone: autograd accumulates into p.grad in place
                 norm = torch.sqrt(sum(up(g).pow(2).sum() for g in gA)).clamp_min(1e-12)
                 saved = [p.detach().clone() for p in plastic]
-            for k, sign in enumerate(signs):
+            for k, (sign, w) in enumerate(passes):
                 with torch.no_grad():
                     if k > 0:
                         for p, sv in zip(plastic, saved):
@@ -259,9 +271,9 @@ def compute_grad(model, params, plastic, xb, yb, cfg, rng, log_cos=False, eta=No
                     alpha = (-sign * eta / norm).to(gA[0].dtype)
                     for p, g in zip(plastic, gA):
                         p.add_(g * alpha)
-                    pre = [up(p.grad).clone() for p in plastic] if log_cos else None
+                    pre = [up(p.grad).clone() for p in plastic] if (log_cos and sign != 0.0) else None
                 (model(xq, yq) * w).backward()
-                if log_cos:
+                if pre is not None:
                     with torch.no_grad():
                         dot = nA = nB = 0.0
                         for p, ga, pr in zip(plastic, gA, pre):
@@ -443,6 +455,9 @@ def main(argv=None):
     }
     with open(os.path.join(out, "result.json"), "w") as f:
         json.dump(result, f, indent=1)
+    if cfg.save_model:
+        torch.save(model.state_dict(), cfg.save_model)
+        log(f"[proxy] saved model to {cfg.save_model}")
     log(f"[proxy] done: final val {result['final_val']:.4f} | best val {best_val:.4f} | "
         f"{result['minutes']:.1f} min | wrote {out}/result.json")
     return result
