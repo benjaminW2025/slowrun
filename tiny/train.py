@@ -45,7 +45,40 @@ if "LOCAL_RANK" in os.environ:
 
 # Custom CUDA/Triton kernels (fused fp8 softcapped CE with MTP). Imported here, after the
 # device bind above, because the CE kernel is compiled against the current CUDA context.
-from cuda_kernels import CE_KERNEL_VOCAB_SIZE, FusedSoftcappedCrossEntropy
+# The kernel is compiled for sm_90 (Hopper). Elsewhere (e.g. a single L40 for development) a
+# pure-PyTorch bf16 implementation of the same loss is used instead. Override with
+# SLOWRUN_CE=fused|torch (default auto: fused on compute capability 9.x, torch otherwise).
+_CE_BACKEND = os.environ.get("SLOWRUN_CE", "auto")
+USE_FUSED_CE = _CE_BACKEND == "fused" or (
+    _CE_BACKEND == "auto" and torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9)
+if USE_FUSED_CE:
+    from cuda_kernels import CE_KERNEL_VOCAB_SIZE, FusedSoftcappedCrossEntropy
+else:
+    CE_KERNEL_VOCAB_SIZE = 50304   # same padded vocab the fused kernel is compiled for
+    FusedSoftcappedCrossEntropy = None
+
+
+def softcapped_mtp_ce_torch(x, targets, mtp_weights, w, cap=15.0):
+    """Pure-PyTorch version of FusedSoftcappedCrossEntropy (bf16 matmul instead of fp8).
+    x: (N, H) flattened rows, targets: (N,), w: (H, V) lm_head weight in the kernel's layout.
+    Per row i: sum_k mtp_weights[k] * (logsumexp(z_i) - z_i[targets[i + k]]) over the padded
+    vocab, with z = cap * tanh(logits / cap); like the kernel, targets[i + k] indexes the flattened
+    batch (it can run past the end of a sequence) and is skipped when i + k >= N or the target is
+    outside [0, V). Returns the per-row losses (N,), as the kernel does."""
+    logits = (x @ w.to(x.dtype)).float()
+    z = cap * torch.tanh(logits / cap)
+    lse = torch.logsumexp(z, dim=-1)
+    N, V = z.shape
+    rows = torch.arange(N, device=z.device)
+    total = torch.zeros(N, device=z.device, dtype=torch.float32)
+    for k in range(mtp_weights.shape[0]):
+        idx = rows + k
+        in_range = idx < N
+        tgt = targets[idx.clamp(max=N - 1)]
+        valid = in_range & (tgt >= 0) & (tgt < V)
+        zt = z.gather(1, tgt.clamp(0, V - 1).unsqueeze(1)).squeeze(1)
+        total = total + torch.where(valid, mtp_weights[k].float() * (lse - zt), torch.zeros_like(lse))
+    return total
 
 _script_start = time.time()
 
@@ -129,6 +162,9 @@ parser.add_argument("--mtp-anneal-frac", type=float, default=0.66,
                     help="Fraction of training over which the extra MTP heads decay to zero weight.")
 # --- every-step meta-gradient step (default for this entry; --mg-every 0 = entry 14) ---
 parser.add_argument("--seed", type=int, default=42)
+parser.add_argument("--train-frac", type=float, default=1.0,
+                    help="use only the first fraction of training documents (reduced-scale development); 1.0 = the full 100M tokens")
+parser.add_argument("--eval-tokens", type=int, default=10_000_000, help="validation tokens per eval (record: 10M)")
 parser.add_argument("--mg-every", type=int, default=1, help="meta-gradient step every N steps (1 = every step, the record; 0 = off = entry 14)")
 parser.add_argument("--mg-step-norm", type=float, default=0.5, help="L2 norm of the temporary step on the plastic matrices")
 parser.add_argument("--mg-step-schedule", type=str, default="const", choices=["const", "lr"])
@@ -170,7 +206,7 @@ DEPTH = args.n_layer
 MAX_SEQ_LEN = 2048
 WINDOW_PATTERN = "SSSL"
 TOTAL_BATCH_SIZE = args.total_batch_size
-EVAL_TOKENS = 10_000_000
+EVAL_TOKENS = args.eval_tokens
 DATA_DIR = "fineweb_data"
 BOS_ID = 50256  # <|endoftext|>
 RUNS_DIR = "runs"
@@ -704,6 +740,8 @@ class GPT(nn.Module):
         to (n_embd, vocab) -- the layout the kernel expects.
         """
         x_flat = x.reshape(-1, x.size(-1)).contiguous()
+        if not USE_FUSED_CE:
+            return softcapped_mtp_ce_torch(x_flat, targets.reshape(-1), mtp_weights, self.lm_head.weight)
         assert self.lm_head.weight.size(1) == CE_KERNEL_VOCAB_SIZE, (
             f"lm_head vocab {self.lm_head.weight.size(1)} != fused kernel VOCAB_SIZE {CE_KERNEL_VOCAB_SIZE}")
         return FusedSoftcappedCrossEntropy.apply(
@@ -972,7 +1010,7 @@ class DataLoader:
     doc_shuffle=True: reshuffles documents each epoch, re-chunks, re-shuffles sequences.
     """
 
-    def __init__(self, filepath, B, T, device="cuda", *, doc_shuffle=False):
+    def __init__(self, filepath, B, T, device="cuda", *, doc_shuffle=False, frac=1.0):
         data = torch.load(filepath, weights_only=True)
         all_tokens = data["tokens"].long()
         raw_doc_starts = data["doc_starts"].long()
@@ -981,6 +1019,13 @@ class DataLoader:
 
         doc_ends = torch.cat([raw_doc_starts[1:], torch.tensor([all_tokens.numel()])])
         self.doc_tokens = [all_tokens[s:e] for s, e in zip(raw_doc_starts.tolist(), doc_ends.tolist())]
+        if frac < 1.0:   # keep the first documents until frac of all tokens is reached
+            budget, kept, n = frac * all_tokens.numel(), [], 0
+            for d in self.doc_tokens:
+                if n >= budget:
+                    break
+                kept.append(d); n += d.numel()
+            self.doc_tokens = kept
         self.default_shuffle_seed = data["seq_shuffle_seed"]
 
         _, rank, _, world_size = get_dist_info()
@@ -1293,13 +1338,15 @@ mg_owned_params = [mg_params[i] for i in mg_owned]
 mg_ema, mg_ema_count = None, 0   # rank-local EMA of g_A for --mg-dir noise
 
 @torch.no_grad()
-def mg_temporary_step(step):
+def mg_temporary_step(step, grads=None, rank_id=None):
     """theta_P <- theta_P - eta * g_P / ||g_P|| with g the gradient of the first half-batch on this rank.
     Returns (scaled gradient of the owned matrices, alpha) so the caller can undo the step: the Muon
     step overwrites every matrix this rank does not own with the owner's all-gathered copy, so only
     the owned matrices need restoring."""
     global mg_ema, mg_ema_count
-    grads = [p.grad if p.grad is not None else torch.zeros_like(p) for p in mg_params]
+    if grads is None:   # default: the gradient accumulated so far (the 8xH100 path, grad_accum == 1)
+        grads = [p.grad if p.grad is not None else torch.zeros_like(p) for p in mg_params]
+    rank_id = ddp_rank if rank_id is None else rank_id
     c = 0.0   # coefficient on the EMA in the direction d = g_A - c * m_hat (c = 0 -> plain g_A)
     if args.mg_dir == "noise":
         if mg_ema is None:
@@ -1319,7 +1366,7 @@ def mg_temporary_step(step):
     elif args.mg_sign == "ascent":
         sign = -1.0
     else:   # deterministic fair coin per (seed, step, rank); restore uses the returned alpha, so undo is exact
-        sign = 1.0 if random.Random(args.seed * 10_000_019 + step * 1_009 + ddp_rank).random() < 0.5 else -1.0
+        sign = 1.0 if random.Random(args.seed * 10_000_019 + step * 1_009 + rank_id).random() < 0.5 else -1.0
     alpha = -sign * eta / float(norm)
     if c == 0.0:
         kept = [grads[i].clone() for i in mg_owned]
@@ -1336,7 +1383,8 @@ def mg_temporary_step(step):
 # Dataloaders
 _train_path = args.input_bin if args.input_bin else os.path.join(DATA_DIR, "fineweb_train.pt")
 _val_path = args.input_val_bin if args.input_val_bin else os.path.join(DATA_DIR, "fineweb_val.pt")
-train_loader = DataLoader(_train_path, args.device_batch_size, MAX_SEQ_LEN, device=device, doc_shuffle=not args.no_doc_shuffle)
+train_loader = DataLoader(_train_path, args.device_batch_size, MAX_SEQ_LEN, device=device, doc_shuffle=not args.no_doc_shuffle,
+                          frac=args.train_frac)
 build_val_loader = lambda: DataLoader(_val_path, args.device_batch_size, MAX_SEQ_LEN, device=device)
 TOKENS_PER_EPOCH = train_loader.total_tokens
 x, y, current_epoch = next(train_loader)
@@ -1353,8 +1401,9 @@ wd_phase1_end_step = round(args.wd_phase1_epoch / args.num_epochs * num_train_st
 wd_phase2_end_step = round(args.wd_phase2_epoch / args.num_epochs * num_train_steps)
 print0(f"Batch size: {TOTAL_BATCH_SIZE:,} tokens, grad accum: {grad_accum_steps} steps")
 if MG and grad_accum_steps != 1:
-    raise SystemExit(f"[mg] the tiny-track meta-gradient step needs grad_accum == 1 (got {grad_accum_steps}); "
-                     f"raise --device-batch-size so device_batch_size * {MAX_SEQ_LEN} * world_size == {TOTAL_BATCH_SIZE}")
+    print0(f"[mg] grad_accum = {grad_accum_steps}: each micro-step emulates one rank of the record (its "
+           f"{args.device_batch_size}-sequence batch split in halves); cos logging is off in this mode")
+    assert args.device_batch_size % 2 == 0, "MG with grad accumulation needs an even --device-batch-size"
 print0(f"Training for {args.num_epochs} epoch(s) (~{num_train_steps} steps estimated)")
 if args.max_train_steps > 0:
     print0(f"Stopping after max_train_steps={args.max_train_steps:,}")
@@ -1527,6 +1576,30 @@ while current_epoch <= args.num_epochs:
         # temporary step (low for descent, high for ascent), which would confound train-loss comparisons
         train_loss = loss.detach()
         x, y, epoch = next(train_loader)
+    elif MG and step % args.mg_every == 0:
+        # grad accumulation (e.g. one GPU): each micro-step plays one rank of the 8xH100 run. Its device batch
+        # is split in halves: the first half's gradient (this micro-step only) gives the temporary step, the
+        # second half is evaluated at the adapted point, the step is undone. The optimizer receives the
+        # ordinary mean gradient over all micro-steps.
+        half = x.size(0) // 2
+        for micro_step in range(grad_accum_steps):
+            with torch.no_grad():
+                prev = [p.grad.detach().clone() if p.grad is not None else None for p in mg_params]
+            with autocast_ctx:
+                loss = model(x[:half], y[:half], num_iterations=active_num_iterations, mtp_weights=mtp_w).mean()
+            (loss * (0.5 / grad_accum_steps)).backward()
+            with torch.no_grad():
+                gA = [p.grad - pv if pv is not None else p.grad.clone() for p, pv in zip(mg_params, prev)]
+            del prev
+            mg_kept, mg_alpha = mg_temporary_step(step, grads=gA, rank_id=ddp_rank * grad_accum_steps + micro_step)
+            with autocast_ctx:
+                loss_q = model(x[half:], y[half:], num_iterations=active_num_iterations, mtp_weights=mtp_w).mean()
+            (loss_q * (0.5 / grad_accum_steps)).backward()
+            with torch.no_grad():
+                torch._foreach_add_(mg_owned_params, mg_kept, alpha=-mg_alpha)   # restore the owned matrices
+            del mg_kept, gA
+            train_loss = loss.detach()   # unperturbed half only (see above)
+            x, y, epoch = next(train_loader)
     else:
         for micro_step in range(grad_accum_steps):
             with autocast_ctx:
