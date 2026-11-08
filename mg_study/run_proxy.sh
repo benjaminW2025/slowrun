@@ -10,6 +10,7 @@
 # Pick the GPU with CUDA_VISIBLE_DEVICES=0 (default: GPU 0). Extra args after the mode go to proxy.py,
 # e.g. `bash mg_study/run_proxy.sh step0 --train-tokens 10000000` (use the same extras for every mode).
 set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/env.sh"   # keep every cache/temp dir off $HOME
 MODE=${1:-}; shift || true
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
 PY=${PY:-python3}

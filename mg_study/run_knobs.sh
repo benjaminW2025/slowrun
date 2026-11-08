@@ -7,6 +7,7 @@
 # Pick EPS with mg_study/probe_precision.py first. Run from the repo root:
 #   CUDA_VISIBLE_DEVICES=1 EPS=0.0625 nohup bash mg_study/run_knobs.sh > knobs.log 2>&1 &
 set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/env.sh"   # keep every cache/temp dir off $HOME
 PY=${PY:-python3}
 S=${SEED:-42}; EPS=${EPS:-0.0625}; TARGET=${TARGET:-0.125}
 A=$($PY -c "print($TARGET / $EPS)"); B=$($PY -c "print(($TARGET / $EPS) ** 2)")

@@ -10,6 +10,7 @@
 # about the record's step count at FRAC 0.125), DBS (sequences per micro-step = one emulated rank, default 8,
 # so 4 emulated ranks). On one L40 the previous default (512 wide, 25% data) measured 1.57 s/step, ~90-110 min/run.
 set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/env.sh"   # keep every cache/temp dir off $HOME
 MODE=${1:-}; shift || true
 WIDTH=${WIDTH:-384}; HEADS=${HEADS:-3}; FRAC=${FRAC:-0.125}; BATCH=${BATCH:-65536}; DBS=${DBS:-8}
 export WANDB_MODE=${WANDB_MODE:-offline}

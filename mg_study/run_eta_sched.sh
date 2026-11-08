@@ -7,6 +7,7 @@
 # arms: descent with eta adaptive (start 0.5, keep cos(g_A, g_B(theta')) >= target), eta = 0.5 x LR multiplier,
 # and eta constant at the adaptive run's mean eta (control: same average amount of MG, no cosine tracking).
 set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/env.sh"   # keep every cache/temp dir off $HOME
 PY=${PY:-python3}
 S=${SEED:-42}
 COMMON="--seed $S --eval-every 100 ${EXTRA:-}"   # EXTRA: extra proxy.py args (tests only)
