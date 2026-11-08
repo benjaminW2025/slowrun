@@ -15,6 +15,7 @@ export HF_HOME="$SLOWRUN_CACHE/huggingface"             # default ~/.cache/huggi
 export XDG_CACHE_HOME="$SLOWRUN_CACHE/xdg_cache"        # anything else using ~/.cache
 export PIP_CACHE_DIR="$SLOWRUN_CACHE/pip"
 export MPLCONFIGDIR="$SLOWRUN_CACHE/matplotlib"
+export PYTHONUNBUFFERED=1                               # nohup logs show prints immediately
 export TMPDIR="$SLOWRUN_CACHE/tmp"                      # tempfile (test_proxy.py synthetic data)
 mkdir -p "$WANDB_DIR" "$WANDB_DATA_DIR" "$WANDB_CACHE_DIR" "$WANDB_CONFIG_DIR" "$WANDB_ARTIFACT_DIR" \
          "$TRITON_CACHE_DIR" "$TORCHINDUCTOR_CACHE_DIR" "$TORCH_HOME" "$CUDA_CACHE_PATH" "$HF_HOME" \
