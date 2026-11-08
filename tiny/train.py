@@ -165,6 +165,12 @@ parser.add_argument("--seed", type=int, default=42)
 parser.add_argument("--aug-replace-rate", type=float, default=0.0,
                     help="input-token augmentation: replace this fraction of training INPUT tokens with uniformly random "
                          "tokens (targets stay clean; BOS never replaced; evals see clean text). 0 = off (the record)")
+parser.add_argument("--aug-target", type=str, default="uniform", choices=["uniform", "predictable"],
+                    help="uniform: every non-BOS input token equally likely to be replaced. predictable: only the "
+                         "--aug-target-frac most predictable input tokens (lowest surprisal under the current model, "
+                         "from an extra no-grad clean forward per micro-step, ~+33%% compute) are candidates, each "
+                         "replaced with prob rate/frac, so the overall replaced fraction matches uniform")
+parser.add_argument("--aug-target-frac", type=float, default=0.5, help="predictable: fraction of input tokens that are candidates")
 parser.add_argument("--aug-schedule", type=str, default="const", choices=["const", "decay", "warmdown"],
                     help="replace rate over training: const; decay = linear to 0 at the end; "
                          "warmdown = constant, then x LR multiplier during warmdown (0 at the end)")
@@ -1447,6 +1453,32 @@ def get_aug_rate(it):
         return r * (1.0 if it < num_train_steps - round(WARMDOWN_RATIO * num_train_steps) else get_lr_multiplier(it))
     return r
 
+def aug_targeted(x, y, rate):
+    """--aug-target predictable: replace input tokens the current model finds most predictable.
+    Surprisal of input token x[:, t] (t >= 1) is the clean next-token loss at position t-1, from an eval-mode
+    (dropout off) no-grad forward of this same micro-batch (the eval call shape, so no new compile)."""
+    if rate <= 0:
+        return x
+    was_training = model.training
+    model.eval()
+    with torch.no_grad(), autocast_ctx:
+        nll = model(x, y, loss_reduction='none', num_iterations=active_num_iterations).view(x.shape).float()
+    model.train(was_training)
+    surpr = torch.full_like(nll, float("inf"))
+    surpr[:, 1:] = nll[:, :-1]
+    surpr = surpr.masked_fill(x == BOS_ID, float("inf"))   # BOS never replaced; position 0 has no surprisal
+    flat = surpr.flatten()
+    k = max(1, min(flat.numel(), int(args.aug_target_frac * flat.numel())))
+    thresh = flat.kthvalue(k).values
+    if train_loader.aug_gen is None:
+        train_loader.aug_gen = torch.Generator(device=x.device)
+        train_loader.aug_gen.manual_seed(10_007 * (args.seed + 1) + train_loader.rank)
+    g = train_loader.aug_gen
+    p = min(1.0, rate / args.aug_target_frac)
+    hit = (surpr <= thresh) & torch.isfinite(surpr) & (torch.rand(x.shape, generator=g, device=x.device) < p)
+    rnd = torch.randint(0, AUG_VOCAB, x.shape, generator=g, device=x.device, dtype=x.dtype)
+    return torch.where(hit, rnd, x)
+
 def get_lr_multiplier(it):
     warmup = round(WARMUP_RATIO * num_train_steps)
     warmdown = round(WARMDOWN_RATIO * num_train_steps)
@@ -1574,10 +1606,14 @@ while current_epoch <= args.num_epochs:
     mtp_w = get_mtp_weights(step)  # same weights across the grad-accum micro-steps
     # augmentation rate for the batches fetched during this step (the first micro-batch was prefetched at the
     # previous step's rate: a one-step lag, negligible)
-    train_loader.replace_rate = get_aug_rate(step)
+    aug_rate_now = get_aug_rate(step)
+    targeted = args.aug_target == "predictable" and aug_rate_now > 0
+    train_loader.replace_rate = 0.0 if args.aug_target == "predictable" else aug_rate_now   # uniform: in the loader
     if MG and step % args.mg_every == 0 and grad_accum_steps == 1:
         # split pairing on the device batch: first half adapts, second half is evaluated at the
         # adapted point; the optimizer receives the ordinary full-batch mean gradient
+        if targeted:
+            x = aug_targeted(x, y, aug_rate_now)
         half = x.size(0) // 2
         with autocast_ctx:
             loss = model(x[:half], y[:half], num_iterations=active_num_iterations, mtp_weights=mtp_w).mean()
@@ -1616,6 +1652,8 @@ while current_epoch <= args.num_epochs:
         # ordinary mean gradient over all micro-steps.
         half = x.size(0) // 2
         for micro_step in range(grad_accum_steps):
+            if targeted:
+                x = aug_targeted(x, y, aug_rate_now)
             with torch.no_grad():
                 prev = [p.grad.detach().clone() if p.grad is not None else None for p in mg_params]
             with autocast_ctx:
@@ -1635,6 +1673,8 @@ while current_epoch <= args.num_epochs:
             x, y, epoch = next(train_loader)
     else:
         for micro_step in range(grad_accum_steps):
+            if targeted:
+                x = aug_targeted(x, y, aug_rate_now)
             with autocast_ctx:
                 # MTP path returns per-token weighted loss (B*T,); mean() reduces it as
                 # before. During the MTP phase this loss is the weighted multi-offset sum,
@@ -1692,7 +1732,7 @@ while current_epoch <= args.num_epochs:
     steps_done = step - 3
     eta_str = f" | eta: {(target_iterations - step) * total_training_time / steps_done / 60:.1f}m" if steps_done > 0 else ""
     train_backprop_iterations = min(TRAIN_BACKPROP_ITERATIONS, active_num_iterations)
-    print0(f"step {step:05d} ({pct:.2f}%) | loss: {debiased:.6f} | dt: {dt*1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f}% | iters: {active_num_iterations}{f" | aug {train_loader.replace_rate:.3f}" if args.aug_replace_rate > 0 else ""}{eta_str}")
+    print0(f"step {step:05d} ({pct:.2f}%) | loss: {debiased:.6f} | dt: {dt*1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f}% | iters: {active_num_iterations}{f" | aug {aug_rate_now:.3f} ({args.aug_target})" if args.aug_replace_rate > 0 else ""}{eta_str}")
     wandb_run.log({
         "step": step,
         "train/loss": debiased,
