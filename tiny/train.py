@@ -162,6 +162,12 @@ parser.add_argument("--mtp-anneal-frac", type=float, default=0.66,
                     help="Fraction of training over which the extra MTP heads decay to zero weight.")
 # --- every-step meta-gradient step (default for this entry; --mg-every 0 = entry 14) ---
 parser.add_argument("--seed", type=int, default=42)
+parser.add_argument("--aug-replace-rate", type=float, default=0.0,
+                    help="input-token augmentation: replace this fraction of training INPUT tokens with uniformly random "
+                         "tokens (targets stay clean; BOS never replaced; evals see clean text). 0 = off (the record)")
+parser.add_argument("--aug-schedule", type=str, default="const", choices=["const", "decay", "warmdown"],
+                    help="replace rate over training: const; decay = linear to 0 at the end; "
+                         "warmdown = constant, then x LR multiplier during warmdown (0 at the end)")
 parser.add_argument("--train-frac", type=float, default=1.0,
                     help="use only the first fraction of training documents (reduced-scale development); 1.0 = the full 100M tokens")
 parser.add_argument("--eval-tokens", type=int, default=10_000_000, help="validation tokens per eval (record: 10M)")
@@ -1037,6 +1043,8 @@ class DataLoader:
         self.seq_size = T + 1
         self.doc_shuffle = doc_shuffle
         self.epoch = 1
+        self.replace_rate = 0.0   # input-token augmentation (set per step by the training loop)
+        self.aug_gen = None       # its own RNG, so dropout etc. draw the same random numbers as without it
         self._build_batches()
 
     def _build_batches(self):
@@ -1082,7 +1090,15 @@ class DataLoader:
             self._next_epoch()
         batch = self.rank_data[self.pos].to(self.device, non_blocking=True)
         self.pos += 1
-        return batch[:, :-1].contiguous(), batch[:, 1:].contiguous(), self.epoch
+        x, y = batch[:, :-1].contiguous(), batch[:, 1:].contiguous()
+        if self.replace_rate > 0:
+            if self.aug_gen is None:
+                self.aug_gen = torch.Generator(device=x.device)
+                self.aug_gen.manual_seed(10_007 * (args.seed + 1) + self.rank)
+            hit = (torch.rand(x.shape, generator=self.aug_gen, device=x.device) < self.replace_rate) & (x != BOS_ID)
+            rnd = torch.randint(0, AUG_VOCAB, x.shape, generator=self.aug_gen, device=x.device, dtype=x.dtype)
+            x = torch.where(hit, rnd, x)
+        return x, y, self.epoch
 
 # =============================================================================
 # Loss evaluation
@@ -1265,6 +1281,7 @@ print0(f"-----------------------")
 # Load GPT-2 tokenizer and compute token_bytes for BPB evaluation
 encoder = tiktoken.get_encoding("gpt2")
 vocab_size = encoder.n_vocab  # 50257
+AUG_VOCAB = vocab_size        # random replacement tokens are drawn from the real (unpadded) vocab
 print0(f"Vocab size: {vocab_size:,}")
 
 eot_id = encoder._special_tokens['<|endoftext|>']
@@ -1417,6 +1434,17 @@ for stage in ITERATION_SCHEDULE.stages:
 print0(f"Eval set: {EVAL_TOKENS:,} tokens")
 
 
+def get_aug_rate(it):
+    """Input-token replacement rate at step `it` (see --aug-replace-rate / --aug-schedule)."""
+    r = args.aug_replace_rate
+    if r <= 0:
+        return 0.0
+    if args.aug_schedule == "decay":
+        return r * max(0.0, 1.0 - it / max(1, num_train_steps))
+    if args.aug_schedule == "warmdown":
+        return r * (1.0 if it < num_train_steps - round(WARMDOWN_RATIO * num_train_steps) else get_lr_multiplier(it))
+    return r
+
 def get_lr_multiplier(it):
     warmup = round(WARMUP_RATIO * num_train_steps)
     warmdown = round(WARMDOWN_RATIO * num_train_steps)
@@ -1542,6 +1570,9 @@ while current_epoch <= args.num_epochs:
     synchronize()
     t0 = time.time()
     mtp_w = get_mtp_weights(step)  # same weights across the grad-accum micro-steps
+    # augmentation rate for the batches fetched during this step (the first micro-batch was prefetched at the
+    # previous step's rate: a one-step lag, negligible)
+    train_loader.replace_rate = get_aug_rate(step)
     if MG and step % args.mg_every == 0 and grad_accum_steps == 1:
         # split pairing on the device batch: first half adapts, second half is evaluated at the
         # adapted point; the optimizer receives the ordinary full-batch mean gradient
@@ -1659,7 +1690,7 @@ while current_epoch <= args.num_epochs:
     steps_done = step - 3
     eta_str = f" | eta: {(target_iterations - step) * total_training_time / steps_done / 60:.1f}m" if steps_done > 0 else ""
     train_backprop_iterations = min(TRAIN_BACKPROP_ITERATIONS, active_num_iterations)
-    print0(f"step {step:05d} ({pct:.2f}%) | loss: {debiased:.6f} | dt: {dt*1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f}% | iters: {active_num_iterations}{eta_str}")
+    print0(f"step {step:05d} ({pct:.2f}%) | loss: {debiased:.6f} | dt: {dt*1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f}% | iters: {active_num_iterations}{f" | aug {train_loader.replace_rate:.3f}" if args.aug_replace_rate > 0 else ""}{eta_str}")
     wandb_run.log({
         "step": step,
         "train/loss": debiased,
