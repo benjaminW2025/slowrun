@@ -1247,7 +1247,9 @@ if args.wandb_group:
 _wandb_kwargs["dir"] = os.path.join(run_dir, "wandb")
 wandb_run = DummyWandb() if not master_process else wandb.init(**_wandb_kwargs)
 if master_process:
-    wandb_run.log_code(".")
+    # only this script's folder: log_code(".") walks the whole repo, and with a virtualenv inside the repo it
+    # copied every .py file of the environment into wandb's staging dir on every run (slow, and filled $HOME)
+    wandb_run.log_code(os.path.dirname(os.path.abspath(__file__)))
 
 # Print hyperparameters
 print0(f"--- Hyperparameters ---")
