@@ -186,6 +186,11 @@ parser.add_argument("--mg-log-every", type=int, default=0,
 parser.add_argument("--mg-dir", type=str, default="grad", choices=["grad", "noise"],
                     help="temporary-step direction: grad = g_A (the record); noise = g_A - EMA(g_A) (Friendly-SAM style: removes the full-gradient component)")
 parser.add_argument("--mg-ema-decay", type=float, default=0.9, help="EMA decay for --mg-dir noise (rank-local EMA of g_A on the plastic matrices)")
+parser.add_argument("--mg-diag-every", type=int, default=0,
+                    help="every N steps log how MG changes Muon's update (single-GPU MG path only): cos between the "
+                         "Muon directions from the plain and the MG gradient, the share of MG's correction Muon's "
+                         "orthogonalization erases, and the step-to-step cosine of Muon's update. Costs one extra "
+                         "B-half forward/backward per micro-step on those steps. 0 = off")
 parser.add_argument("--mg-sign", type=str, default="descent", choices=["descent", "ascent", "random"],
                     help="direction of the temporary step: descent = -eta*g/|g| (the record), ascent = +eta*g/|g| (SAM-like), "
                     "random = fair coin per (step, rank); random cancels the O(eta) lookahead term in expectation and keeps the O(eta^2) flatness term")
@@ -1363,6 +1368,9 @@ if MG:
            f"{len(mg_params)} plastic matrices, {sum(p.numel() for p in mg_params):,} parameters; "
            f"rank {ddp_rank} restores {len(mg_owned)} of them")
 mg_owned_params = [mg_params[i] for i in mg_owned]
+_muon_index = {id(p): (g, i) for g in optimizer.param_groups if g["kind"] == "muon" for i, p in enumerate(g["params"])}
+if args.mg_diag_every > 0:
+    assert ddp_world_size == 1, "--mg-diag-every reads the optimizer state of every matrix: single process only"
 mg_ema, mg_ema_count = None, 0   # rank-local EMA of g_A for --mg-dir noise
 
 @torch.no_grad()
@@ -1407,6 +1415,79 @@ def mg_temporary_step(step, grads=None, rank_id=None):
         torch._foreach_lerp_(mg_ema, grads, 1.0 - args.mg_ema_decay)
         mg_ema_count += 1
     return kept, alpha
+
+# ---- MG diagnostics (--mg-diag-every) ----
+mg_diag_plain = None        # plain-gradient accumulation of the plastic matrices on a diagnostic step
+mg_diag_prev_U = None       # Muon direction on the previous step (for the step-to-step cosine)
+mg_diag_step = -1
+
+@torch.no_grad()
+def muon_direction(grads, step):
+    """Muon's update direction (before lr) for each plastic matrix given gradients `grads`, replicating
+    muon_step_fused (Nesterov-lerp momentum, Polar Express, variance rescaling) on copies: the optimizer state is
+    not modified. Single process only. Returns (directions, pre-orthogonalization inputs)."""
+    mom = get_muon_momentum(step)
+    outs, ins = [], []
+    for p, G in zip(mg_params, grads):
+        group, idx = _muon_index[id(p)]
+        st = optimizer.state.get(group["params"][0], {})
+        G = G.float()
+        buf = st["momentum_buffer"][idx].float() if "momentum_buffer" in st else torch.zeros_like(G)
+        buf_new = buf * mom + G * (1 - mom)
+        g = G.lerp(buf_new, mom)
+        ins.append(g)
+        X = g / (g.norm() * 1.02 + 1e-6)
+        if X.size(-2) > X.size(-1):
+            for a, b, c in polar_express_coeffs[:group["ns_steps"]]:
+                A = X.mT @ X
+                X = a * X + X @ (b * A + c * (A @ A))
+        else:
+            for a, b, c in polar_express_coeffs[:group["ns_steps"]]:
+                A = X @ X.mT
+                X = a * X + (b * A + c * (A @ A)) @ X
+        red_dim = -1 if p.shape[-2] >= p.shape[-1] else -2
+        beta2 = group["beta2"]
+        v_mean = X.square().mean(dim=red_dim, keepdim=True)
+        v_norm = (v_mean.sum() * X.size(red_dim)).sqrt()
+        sbuf = st["second_momentum_buffer"][idx].float() if "second_momentum_buffer" in st else torch.zeros_like(v_mean)
+        sbuf_new = sbuf * beta2 + v_mean * (1 - beta2)
+        step_size = sbuf_new.clamp_min(1e-10).rsqrt()
+        v_norm_new = ((v_mean * X.size(red_dim)) * step_size.square()).sum().sqrt()
+        outs.append(X * step_size * (v_norm / v_norm_new.clamp_min(1e-10)))
+    return outs, ins
+
+def _cos(xs, ys):
+    num = sum((x * y).sum() for x, y in zip(xs, ys))
+    return float(num / (torch.sqrt(sum(x.square().sum() for x in xs)) * torch.sqrt(sum(y.square().sum() for y in ys))).clamp_min(1e-30))
+
+@torch.no_grad()
+def mg_diag_report(step):
+    """Called right before optimizer.step(). On a diagnostic step: compare Muon's update from the MG gradient
+    (p.grad) with the one from the plain gradient (mg_diag_plain). On the step after: step-to-step cosine."""
+    global mg_diag_prev_U, mg_diag_plain, mg_diag_step
+    G_mg = [p.grad.float() if p.grad is not None else torch.zeros_like(p, dtype=torch.float32) for p in mg_params]
+    if mg_diag_plain is not None and mg_diag_step == step:
+        U_mg, X_mg = muon_direction(G_mg, step)
+        U_pl, X_pl = muon_direction(mg_diag_plain, step)
+        delta = [a - b for a, b in zip(G_mg, mg_diag_plain)]
+        # share of the correction that orthogonalization erases (first order): the symmetric part of
+        # P^T delta Q in the singular basis of the plain Muon input (it only rescales existing directions)
+        erased = total = 0.0
+        for d, x in zip(delta, X_pl):
+            P, S, Qh = torch.linalg.svd(x, full_matrices=False)
+            dt = P.mT @ d @ Qh.mT
+            erased += float(((dt + dt.mT) / 2).square().sum())
+            total += float(d.square().sum())
+        rel = float(torch.sqrt(sum(d.square().sum() for d in delta)) / torch.sqrt(sum(g.square().sum() for g in mg_diag_plain)).clamp_min(1e-30))
+        c = _cos(U_pl, U_mg)
+        print0(f"[mg-diag] step {step} | cos(U_plain, U_mg) {c:.5f} (1-cos {1 - c:.2e}) | |G_mg - G_plain|/|G_plain| {rel:.4f} "
+               f"| erased by orthogonalization {erased / max(total, 1e-30):.3f} | cos(G_plain, G_mg) {_cos(mg_diag_plain, G_mg):.4f}")
+        mg_diag_prev_U = U_mg
+        mg_diag_plain = None
+    elif mg_diag_prev_U is not None and mg_diag_step == step - 1:
+        U_now, _ = muon_direction(G_mg, step)
+        print0(f"[mg-diag] step {step} | cos(U_t, U_t-1) {_cos(U_now, mg_diag_prev_U):.5f} (consecutive Muon updates)")
+        mg_diag_prev_U = None
 
 # Dataloaders
 _train_path = args.input_bin if args.input_bin else os.path.join(DATA_DIR, "fineweb_train.pt")
@@ -1654,6 +1735,10 @@ while current_epoch <= args.num_epochs:
         # second half is evaluated at the adapted point, the step is undone. The optimizer receives the
         # ordinary mean gradient over all micro-steps.
         half = x.size(0) // 2
+        diag_now = args.mg_diag_every > 0 and step % args.mg_diag_every == 0
+        if diag_now:
+            mg_diag_plain = [torch.zeros_like(p, dtype=torch.float32) for p in mg_params]
+            mg_diag_step = step
         for micro_step in range(grad_accum_steps):
             if targeted:
                 x = aug_targeted(x, y, aug_rate_now)
@@ -1671,6 +1756,14 @@ while current_epoch <= args.num_epochs:
             (loss_q * (0.5 / grad_accum_steps)).backward()
             with torch.no_grad():
                 torch._foreach_add_(mg_owned_params, mg_kept, alpha=-mg_alpha)   # restore the owned matrices
+            if diag_now:   # plain gradient of this micro-step: g_A + g_B at the (restored) unperturbed point
+                with autocast_ctx:
+                    loss_b0 = model(x[half:], y[half:], num_iterations=active_num_iterations, mtp_weights=mtp_w).mean()
+                gB0 = torch.autograd.grad(loss_b0 * (0.5 / grad_accum_steps), mg_params)
+                with torch.no_grad():
+                    for acc, a, b in zip(mg_diag_plain, gA, gB0):
+                        acc.add_(a.float()).add_(b.float())
+                del gB0, loss_b0
             del mg_kept, gA
             train_loss = loss.detach()   # unperturbed half only (see above)
             x, y, epoch = next(train_loader)
@@ -1712,6 +1805,8 @@ while current_epoch <= args.num_epochs:
         group["weight_decay"] = group["initial_wd"] * wd_scale
         if group['kind'] == 'muon':
             group["momentum"] = get_muon_momentum(step)
+    if args.mg_diag_every > 0:
+        mg_diag_report(step)
     optimizer.step()
     model.zero_grad(set_to_none=True)
     if ema_params is not None and step % args.update_ema_every == 0:
