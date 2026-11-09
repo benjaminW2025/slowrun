@@ -363,6 +363,7 @@ ITERATION_SCHEDULE = build_iteration_schedule(
 class DummyWandb:
     def __init__(self): self.summary = {}
     def log(self, *a, **kw): pass
+    def log_code(self, *a, **kw): pass
     def finish(self): pass
 
 class TeeStream:
@@ -1251,7 +1252,9 @@ _wandb_kwargs = {"project": "slowrun", "name": run_name}
 if args.wandb_group:
     _wandb_kwargs["group"] = args.wandb_group
 _wandb_kwargs["dir"] = os.path.join(run_dir, "wandb")
-wandb_run = DummyWandb() if not master_process else wandb.init(**_wandb_kwargs)
+# WANDB_MODE=disabled: never start wandb at all (no service process, temp or staging dirs)
+_wandb_off = os.environ.get("WANDB_MODE", "").lower() == "disabled"
+wandb_run = DummyWandb() if (not master_process or _wandb_off) else wandb.init(**_wandb_kwargs)
 if master_process:
     # only this script's folder: log_code(".") walks the whole repo, and with a virtualenv inside the repo it
     # copied every .py file of the environment into wandb's staging dir on every run (slow, and filled $HOME)

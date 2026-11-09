@@ -13,7 +13,7 @@ set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/env.sh"   # keep every cache/temp dir off $HOME
 MODE=${1:-}; shift || true
 WIDTH=${WIDTH:-384}; HEADS=${HEADS:-3}; FRAC=${FRAC:-0.125}; BATCH=${BATCH:-65536}; DBS=${DBS:-8}
-export WANDB_MODE=${WANDB_MODE:-offline}
+export WANDB_MODE=${WANDB_MODE:-disabled}   # results come from runs/NAME/{terminal.log,result.json}; wandb's service + temp dirs break on network storage
 TB="--n_embd $WIDTH --n_head $HEADS --train-frac $FRAC --total-batch-size $BATCH --device-batch-size $DBS --eval-tokens 2000000"
 case "$MODE" in
   smoke) torchrun --standalone --nproc_per_node=1 tiny/train.py $TB --run-name tb_smoke --max-train-steps 40 "$@" ;;
