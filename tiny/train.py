@@ -183,8 +183,10 @@ parser.add_argument("--mg-step-schedule", type=str, default="const", choices=["c
 parser.add_argument("--mg-plastic", type=str, default="mlp_all", choices=["matrix_all", "mlp_all"])
 parser.add_argument("--mg-log-every", type=int, default=0,
                     help="every N steps log cos(g_A, g_B) on the plastic matrices (rank-mean), ~SNR/(1+SNR) of the half-batch gradient; 0 = off")
-parser.add_argument("--mg-dir", type=str, default="grad", choices=["grad", "noise"],
-                    help="temporary-step direction: grad = g_A (the record); noise = g_A - EMA(g_A) (Friendly-SAM style: removes the full-gradient component)")
+parser.add_argument("--mg-dir", type=str, default="grad", choices=["grad", "noise", "prev"],
+                    help="temporary-step direction: grad = g_A (the record); noise = g_A - EMA(g_A) (Friendly-SAM style: removes "
+                         "the full-gradient component); prev = continue along the previous optimizer step, i.e. theta' = theta + "
+                         "eta * (theta_t - theta_t-1)/|theta_t - theta_t-1| on the plastic matrices (falls back to g_A until one exists)")
 parser.add_argument("--mg-ema-decay", type=float, default=0.9, help="EMA decay for --mg-dir noise (rank-local EMA of g_A on the plastic matrices)")
 parser.add_argument("--mg-diag-every", type=int, default=0,
                     help="every N steps log how MG changes Muon's update (single-GPU MG path only): cos between the "
@@ -1372,6 +1374,15 @@ _muon_index = {id(p): (g, i) for g in optimizer.param_groups if g["kind"] == "mu
 if args.mg_diag_every > 0:
     assert ddp_world_size == 1, "--mg-diag-every reads the optimizer state of every matrix: single process only"
 mg_ema, mg_ema_count = None, 0   # rank-local EMA of g_A for --mg-dir noise
+# --mg-dir prev: mg_prev_update = theta_{t-1} - theta_t on the plastic matrices (what the last optimizer step
+# subtracted, weight decay included). Snapshots are taken right after optimizer.step, when every rank holds the
+# same, unperturbed parameters. mg_temporary_step subtracts eta * d/|d|, so d = mg_prev_update steps forward
+# along the previous movement.
+mg_prev_theta, mg_prev_update = None, None
+
+def mg_probe(default):
+    """Direction handed to mg_temporary_step: the previous update for --mg-dir prev (once one exists), else `default`."""
+    return mg_prev_update if (args.mg_dir == "prev" and mg_prev_update is not None) else default
 
 @torch.no_grad()
 def mg_temporary_step(step, grads=None, rank_id=None):
@@ -1741,7 +1752,7 @@ while current_epoch <= args.num_epochs:
         if mg_log:   # snapshot g_A on all plastic matrices (p.grad is still rank-local: the reduction happens in optimizer.step)
             with torch.no_grad():
                 mg_gA = [p.grad.detach().float().clone() if p.grad is not None else torch.zeros_like(p, dtype=torch.float32) for p in mg_params]
-        mg_kept, mg_alpha = mg_temporary_step(step)
+        mg_kept, mg_alpha = mg_temporary_step(step, grads=mg_probe(None))
         with autocast_ctx:
             loss_q = model(x[half:], y[half:], num_iterations=active_num_iterations, mtp_weights=mtp_w).mean()
         (loss_q * 0.5).backward()
@@ -1786,14 +1797,14 @@ while current_epoch <= args.num_epochs:
             with torch.no_grad():
                 gA = [p.grad - pv if pv is not None else p.grad.clone() for p, pv in zip(mg_params, prev)]
             del prev
-            mg_kept, mg_alpha = mg_temporary_step(step, grads=gA, rank_id=ddp_rank * grad_accum_steps + micro_step)
+            mg_kept, mg_alpha = mg_temporary_step(step, grads=mg_probe(gA), rank_id=ddp_rank * grad_accum_steps + micro_step)
             with autocast_ctx:
                 loss_q = model(x[half:], y[half:], num_iterations=active_num_iterations, mtp_weights=mtp_w).mean()
             (loss_q * (0.5 / grad_accum_steps)).backward()
             with torch.no_grad():
                 torch._foreach_add_(mg_owned_params, mg_kept, alpha=-mg_alpha)   # restore the owned matrices
             if diag_now:   # the probe direction this micro-step used, for cos(probe, U)
-                mg_diag_probes = (mg_diag_probes or []) + [[a.float().clone() for a in gA]]
+                mg_diag_probes = (mg_diag_probes or []) + [[a.float().clone() for a in mg_probe(gA)]]
             if diag_now:   # plain gradient of this micro-step: g_A + g_B at the (restored) unperturbed point
                 with autocast_ctx:
                     loss_b0 = model(x[half:], y[half:], num_iterations=active_num_iterations, mtp_weights=mtp_w).mean()
@@ -1846,6 +1857,20 @@ while current_epoch <= args.num_epochs:
     if args.mg_diag_every > 0:
         mg_diag_report(step)
     optimizer.step()
+    if MG and args.mg_dir == "prev":
+        with torch.no_grad():
+            if mg_prev_theta is None:
+                mg_prev_theta = [p.detach().clone() for p in mg_params]
+            else:
+                if mg_prev_update is None:
+                    mg_prev_update = [torch.empty_like(p) for p in mg_params]
+                for u, a, p in zip(mg_prev_update, mg_prev_theta, mg_params):
+                    u.copy_(a).sub_(p)   # theta_{t-1} - theta_t
+                    a.copy_(p)
+                if step % 250 == 0:
+                    un = float(torch.linalg.vector_norm(torch.stack(torch._foreach_norm(mg_prev_update))))
+                    print0(f"[mg-prev] step {step} | |theta_t - theta_t-1| on the plastic matrices {un:.4f} | "
+                           f"probe distance / last step size = {args.mg_step_norm / max(un, 1e-12):.1f}")
     model.zero_grad(set_to_none=True)
     if ema_params is not None and step % args.update_ema_every == 0:
         torch._foreach_lerp_(ema_params, list(model.parameters()), 1 - param_ema_beta)
