@@ -1461,10 +1461,29 @@ def _cos(xs, ys):
     return float(num / (torch.sqrt(sum(x.square().sum() for x in xs)) * torch.sqrt(sum(y.square().sum() for y in ys))).clamp_min(1e-30))
 
 @torch.no_grad()
+def _top_projectors(X, frac=0.05):
+    """Top singular subspaces (left P_k, right Q_k) of X holding the top `frac` of its singular directions,
+    plus the share of X's energy they carry."""
+    P, S, Qh = torch.linalg.svd(X, full_matrices=False)
+    k = max(1, int(round(frac * S.numel())))
+    return P[:, :k], Qh[:k].mT, float(S[:k].square().sum() / S.square().sum().clamp_min(1e-30))
+
+def _split(Us, projs):
+    """Split each matrix into its part inside the given top-k left/right subspaces ('strong') and the rest."""
+    strong = [Pk @ (Pk.mT @ U @ Qk) @ Qk.mT for U, (Pk, Qk, _) in zip(Us, projs)]
+    return strong, [U - st for U, st in zip(Us, strong)]
+
+MG_DIAG_LAGS = (1, 2, 5)
+mg_diag_probes = None   # per micro-step probe directions g_A on a diagnostic step
+mg_diag_base = None     # (step, U, X, projectors) of the last diagnostic step, for the lagged comparisons
+
+@torch.no_grad()
 def mg_diag_report(step):
-    """Called right before optimizer.step(). On a diagnostic step: compare Muon's update from the MG gradient
-    (p.grad) with the one from the plain gradient (mg_diag_plain). On the step after: step-to-step cosine."""
-    global mg_diag_prev_U, mg_diag_plain, mg_diag_step
+    """Called right before optimizer.step(). On a diagnostic step s: compare Muon's update from the MG gradient
+    (p.grad) with the one from the plain gradient (mg_diag_plain), and how the current probe and the gradient line
+    up with the update. On steps s+1, s+2, s+5: similarity to step s's update, overall and split into the strong
+    (top 5% singular directions of step s's Muon input) and weak parts, and of the pre-orthogonalization inputs."""
+    global mg_diag_plain, mg_diag_step, mg_diag_probes, mg_diag_base
     G_mg = [p.grad.float() if p.grad is not None else torch.zeros_like(p, dtype=torch.float32) for p in mg_params]
     if mg_diag_plain is not None and mg_diag_step == step:
         U_mg, X_mg = muon_direction(G_mg, step)
@@ -1482,12 +1501,23 @@ def mg_diag_report(step):
         c = _cos(U_pl, U_mg)
         print0(f"[mg-diag] step {step} | cos(U_plain, U_mg) {c:.5f} (1-cos {1 - c:.2e}) | |G_mg - G_plain|/|G_plain| {rel:.4f} "
                f"| erased by orthogonalization {erased / max(total, 1e-30):.3f} | cos(G_plain, G_mg) {_cos(mg_diag_plain, G_mg):.4f}")
-        mg_diag_prev_U = U_mg
-        mg_diag_plain = None
-    elif mg_diag_prev_U is not None and mg_diag_step == step - 1:
-        U_now, _ = muon_direction(G_mg, step)
-        print0(f"[mg-diag] step {step} | cos(U_t, U_t-1) {_cos(U_now, mg_diag_prev_U):.5f} (consecutive Muon updates)")
-        mg_diag_prev_U = None
+        projs = [_top_projectors(x) for x in X_mg]
+        probe_cos = [_cos(pr, U_mg) for pr in (mg_diag_probes or [])]
+        print0(f"[mg-diag] step {step} | cos(probe g_A, U) mean {sum(probe_cos) / max(1, len(probe_cos)):.4f} over {len(probe_cos)} micro-steps "
+               f"| cos(G, U) {_cos(G_mg, U_mg):.4f} | cos(X, U) {_cos(X_mg, U_mg):.4f} "
+               f"| top-5% singular directions hold {sum(e for _, _, e in projs) / len(projs):.3f} of Muon-input energy")
+        mg_diag_base = (step, U_mg, X_mg, projs)
+        mg_diag_plain, mg_diag_probes = None, None
+    elif mg_diag_base is not None and step - mg_diag_base[0] in MG_DIAG_LAGS:
+        s0, U0, X0, projs = mg_diag_base
+        U_now, X_now = muon_direction(G_mg, step)
+        st_now, wk_now = _split(U_now, projs)
+        st0, wk0 = _split(U0, projs)
+        share = float(sum(a.square().sum() for a in st_now) / sum(u.square().sum() for u in U_now).clamp_min(1e-30))
+        print0(f"[mg-diag] step {step} | lag {step - s0} | cos(U_t, U_t-lag) {_cos(U_now, U0):.5f} | cos(X_t, X_t-lag) {_cos(X_now, X0):.5f} "
+               f"| strong part cos {_cos(st_now, st0):.4f} (share of U {share:.3f}) | weak part cos {_cos(wk_now, wk0):.4f}")
+        if step - s0 == max(MG_DIAG_LAGS):
+            mg_diag_base = None
 
 # Dataloaders
 _train_path = args.input_bin if args.input_bin else os.path.join(DATA_DIR, "fineweb_train.pt")
@@ -1739,6 +1769,7 @@ while current_epoch <= args.num_epochs:
         if diag_now:
             mg_diag_plain = [torch.zeros_like(p, dtype=torch.float32) for p in mg_params]
             mg_diag_step = step
+            mg_diag_probes = None
         for micro_step in range(grad_accum_steps):
             if targeted:
                 x = aug_targeted(x, y, aug_rate_now)
@@ -1756,6 +1787,8 @@ while current_epoch <= args.num_epochs:
             (loss_q * (0.5 / grad_accum_steps)).backward()
             with torch.no_grad():
                 torch._foreach_add_(mg_owned_params, mg_kept, alpha=-mg_alpha)   # restore the owned matrices
+            if diag_now:   # the probe direction this micro-step used, for cos(probe, U)
+                mg_diag_probes = (mg_diag_probes or []) + [[a.float().clone() for a in gA]]
             if diag_now:   # plain gradient of this micro-step: g_A + g_B at the (restored) unperturbed point
                 with autocast_ctx:
                     loss_b0 = model(x[half:], y[half:], num_iterations=active_num_iterations, mtp_weights=mtp_w).mean()
