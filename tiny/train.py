@@ -1506,11 +1506,16 @@ def mg_diag_report(step):
         print0(f"[mg-diag] step {step} | cos(probe g_A, U) mean {sum(probe_cos) / max(1, len(probe_cos)):.4f} over {len(probe_cos)} micro-steps "
                f"| cos(G, U) {_cos(G_mg, U_mg):.4f} | cos(X, U) {_cos(X_mg, U_mg):.4f} "
                f"| top-5% singular directions hold {sum(e for _, _, e in projs) / len(projs):.3f} of Muon-input energy")
-        mg_diag_base = (step, U_mg, X_mg, projs)
+        mg_diag_base = (step, U_mg, X_mg, projs, U_pl)
         mg_diag_plain, mg_diag_probes = None, None
     elif mg_diag_base is not None and step - mg_diag_base[0] in MG_DIAG_LAGS:
-        s0, U0, X0, projs = mg_diag_base
+        s0, U0, X0, projs, U0_pl = mg_diag_base
         U_now, X_now = muon_direction(G_mg, step)
+        # does MG anticipate the trajectory? MG's change to the update at s vs how the update moves from s to t
+        d_mg = [a - b for a, b in zip(U0, U0_pl)]
+        d_traj = [a - b for a, b in zip(U_now, U0)]
+        print0(f"[mg-diag] step {step} | lag {step - s0} | cos(U_mg - U_plain at s, U_t - U_s) {_cos(d_mg, d_traj):+.4f} "
+               f"| cos(U_t, U_mg at s) {_cos(U_now, U0):.5f} vs cos(U_t, U_plain at s) {_cos(U_now, U0_pl):.5f}")
         st_now, wk_now = _split(U_now, projs)
         st0, wk0 = _split(U0, projs)
         share = float(sum(a.square().sum() for a in st_now) / sum(u.square().sum() for u in U_now).clamp_min(1e-30))
