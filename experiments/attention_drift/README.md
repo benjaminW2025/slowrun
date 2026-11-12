@@ -55,3 +55,8 @@ backward-pass savings.
 Compare the logged validation losses at step 4,000 for the early freeze and
 step 6,000 for the later freeze, each against the control at the same step.
 A positive frozen-minus-control difference is the loss penalty for freezing.
+
+To compare the entire loss trajectory, run `python compare_freeze.py` after
+the freeze runs. The output is CSV and includes the shared starting checkpoint
+and every later step present in both the branch and the control. Use
+`python compare_freeze.py > runs/freeze-comparison.csv` to save a copy.
