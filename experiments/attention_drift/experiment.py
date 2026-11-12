@@ -143,6 +143,7 @@ def train(args):
     config["train"] = str(args.train.resolve())
     config["val"] = str(args.val.resolve())
     config["out"] = str(args.out.resolve())
+    config["resume"] = str(args.resume.resolve()) if args.resume else None
     if args.width % args.heads:
         raise ValueError("--width must be divisible by --heads")
     if args.train.resolve() == args.val.resolve():
@@ -162,7 +163,31 @@ def train(args):
     model = Transformer(config).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     sampler = np.random.default_rng(args.data_seed)
+    start_step = 0
+    start_lr = 0.0
+    if args.resume:
+        checkpoint = torch.load(args.resume, map_location="cpu", weights_only=True)
+        if "training_state" not in checkpoint:
+            raise ValueError("Resume requires a checkpoint created with --fork-at")
+        state = checkpoint["training_state"]
+        for key in (
+            "width", "heads", "layers", "context", "vocab_size", "batch_size",
+            "seed", "data_seed", "lr", "warmup", "val_windows", "train_sha256", "val_sha256",
+        ):
+            if state["config"][key] != config[key]:
+                raise ValueError(f"Resume configuration differs for {key}")
+        if checkpoint["metrics"]["step"] >= args.steps:
+            raise ValueError("--steps must be greater than the checkpoint step")
+        model.load_state_dict(checkpoint["model"])
+        optimizer.load_state_dict(state["optimizer"])
+        sampler.bit_generator.state = json.loads(state["sampler"])
+        start_step = checkpoint["metrics"]["step"]
+        start_lr = checkpoint["metrics"]["lr"]
+
     early_steps = {2**power for power in range(8)}
+    qkv = model.blocks[0].attention.qkv.weight
+    qk = qkv[: 2 * args.width]
+    frozen_qk = qk.detach().clone() if args.freeze_layer0_qk else None
     args.out.mkdir(parents=True, exist_ok=False)
     (args.out / "config.json").write_text(json.dumps(config, indent=2) + "\n")
 
@@ -177,13 +202,20 @@ def train(args):
         }
         target = args.out / f"step-{step:08d}.pt"
         temporary = target.with_suffix(".tmp")
-        torch.save({"model": model.state_dict(), "metrics": metrics}, temporary)
+        checkpoint = {"model": model.state_dict(), "metrics": metrics}
+        if step in args.fork_at:
+            checkpoint["training_state"] = {
+                "config": config,
+                "optimizer": optimizer.state_dict(),
+                "sampler": json.dumps(sampler.bit_generator.state),
+            }
+        torch.save(checkpoint, temporary)
         temporary.replace(target)
         print(json.dumps(metrics), flush=True)
         model.train()
 
-    save(0, 0.0)
-    for step in range(1, args.steps + 1):
+    save(start_step, start_lr)
+    for step in range(start_step + 1, args.steps + 1):
         lr = args.lr * min(1.0, step / max(1, args.warmup))
         optimizer.param_groups[0]["lr"] = lr
         offsets = sampler.integers(0, len(train_tokens) - args.context, args.batch_size)
@@ -191,8 +223,14 @@ def train(args):
         optimizer.zero_grad(set_to_none=True)
         logits, _ = model(inputs)
         token_loss(logits, targets).backward()
+        if frozen_qk is not None:
+            qkv.grad[: 2 * args.width].zero_()
         optimizer.step()
-        if step in early_steps or step % args.save_every == 0 or step == args.steps:
+        if frozen_qk is not None:
+            # AdamW momentum and weight decay can still move zero-gradient rows.
+            with torch.no_grad():
+                qk.copy_(frozen_qk)
+        if step in early_steps or step in args.fork_at or step % args.save_every == 0 or step == args.steps:
             save(step, lr)
 
 
@@ -306,6 +344,9 @@ def main():
     training.add_argument("--val", type=Path, default=data_dir / "fineweb_val.pt")
     training.add_argument("--out", type=Path, required=True)
     training.add_argument("--vocab-size", type=positive)
+    training.add_argument("--fork-at", type=positive, nargs="+", default=[])
+    training.add_argument("--resume", type=Path)
+    training.add_argument("--freeze-layer0-qk", action="store_true")
     for name, default in {
         "steps": 12000, "save-every": 250, "warmup": 200, "batch-size": 16,
         "context": 256, "width": 192, "heads": 6, "layers": 6,
@@ -327,6 +368,12 @@ def main():
     if args.command == "train":
         if args.context < 2 or not math.isfinite(args.lr) or args.lr <= 0:
             parser.error("training requires context >= 2 and a finite positive learning rate")
+        if args.freeze_layer0_qk and args.resume is None:
+            parser.error("--freeze-layer0-qk requires --resume")
+        if args.freeze_layer0_qk and args.fork_at:
+            parser.error("--fork-at is only for the unfrozen control")
+        if any(step > args.steps for step in args.fork_at):
+            parser.error("--fork-at steps must be within the training run")
         for name in ("train", "val"):
             path = getattr(args, name)
             if not path.is_file():
