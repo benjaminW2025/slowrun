@@ -2,16 +2,17 @@
 
 Does attention routing settle early while held-out language modeling loss continues to improve? This standalone pilot measures how attention probability distributions change on fixed held-out inputs. See the [experiment protocol](https://chatgpt.com/library?file_id=libfile_bf281aa6eb7c81919dcbd7e54ab39f18&account_id=personal) for the interpretation and follow-up decisions.
 
-Use Python 3.11+ with PyTorch and NumPy. Install Matplotlib to generate the plot. Supply separate, non-overlapping train and validation corpora. Plain files are read as byte IDs for a self-contained pilot. For a subword experiment, supply two one-dimensional integer NumPy `.npy` arrays from the same tokenizer and pass `--vocab-size` to training. The default validation setup needs at least 16,385 tokens.
+Use Python 3.11+ with PyTorch and NumPy. Install Matplotlib to generate the plot. The trainer defaults to the existing Slowrun GPT-2-tokenized splits at `fineweb_data/fineweb_train.pt` and `fineweb_data/fineweb_val.pt` relative to the repo root. If those files live elsewhere, pass their actual paths with `--train` and `--val`.
 
 From this directory, run:
 
 ```sh
-python3 experiment.py train --train /path/to/train.txt --val /path/to/val.txt \
-  --out runs/pilot --seed 0
+python3 experiment.py train --out runs/pilot --batch-size 4
 python3 experiment.py analyze --run runs/pilot
 python3 plot.py --run runs/pilot
 ```
+
+Use separate training and validation splits. Plain text files are read as byte IDs. For pretokenized one-dimensional integer NumPy `.npy` arrays, set `--vocab-size` to match the tokenizer. The default validation setup needs at least 16,385 tokens.
 
 Training and analysis use CUDA when available, otherwise CPU. Set `--device` explicitly to override. The pilot defaults are a six-layer Transformer, context 256, 12,000 steps, and a 200-step warmup followed by constant learning rate. Training samples windows with replacement from a fixed data RNG independent of model initialization. The run directory must be new. Keep the original validation file for analysis, or pass its new location with `--val`. Checkpoints contain weights and metrics for analysis.
 

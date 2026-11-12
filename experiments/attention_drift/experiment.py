@@ -84,12 +84,18 @@ class Transformer(nn.Module):
 
 
 def load_tokens(path, vocab_size):
-    if path.suffix == ".npy":
+    if path.suffix == ".pt":
+        payload = torch.load(path, map_location="cpu", mmap=True, weights_only=True)
+        tokens = payload.get("tokens") if isinstance(payload, dict) else None
+        if not isinstance(tokens, torch.Tensor):
+            raise ValueError(f"{path} must be a Slowrun data file with a tokens tensor")
+        data = tokens.numpy()
+    elif path.suffix == ".npy":
         data = np.load(path, mmap_mode="r", allow_pickle=False)
-        if data.ndim != 1 or not np.issubdtype(data.dtype, np.integer):
-            raise ValueError(f"{path} must contain a 1-D array of integer token IDs")
     else:
         data = np.fromfile(path, dtype=np.uint8)
+    if data.ndim != 1 or not np.issubdtype(data.dtype, np.integer):
+        raise ValueError(f"{path} must contain a 1-D array of integer token IDs")
     if not data.size or data.min() < 0 or data.max() >= vocab_size:
         raise ValueError(f"{path} must contain token IDs in [0, {vocab_size})")
     return data
@@ -295,12 +301,15 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     training = commands.add_parser("train")
-    for name in ("train", "val", "out"):
-        training.add_argument(f"--{name}", type=Path, required=True)
+    data_dir = Path(__file__).resolve().parents[2] / "fineweb_data"
+    training.add_argument("--train", type=Path, default=data_dir / "fineweb_train.pt")
+    training.add_argument("--val", type=Path, default=data_dir / "fineweb_val.pt")
+    training.add_argument("--out", type=Path, required=True)
+    training.add_argument("--vocab-size", type=positive)
     for name, default in {
         "steps": 12000, "save-every": 250, "warmup": 200, "batch-size": 16,
         "context": 256, "width": 192, "heads": 6, "layers": 6,
-        "vocab-size": 256, "val-windows": 64,
+        "val-windows": 64,
     }.items():
         training.add_argument(f"--{name}", type=positive, default=default)
     training.add_argument("--seed", type=int, default=0)
@@ -318,6 +327,12 @@ def main():
     if args.command == "train":
         if args.context < 2 or not math.isfinite(args.lr) or args.lr <= 0:
             parser.error("training requires context >= 2 and a finite positive learning rate")
+        for name in ("train", "val"):
+            path = getattr(args, name)
+            if not path.is_file():
+                parser.error(f"--{name} file not found: {path}. Pass the actual data file path.")
+        if args.vocab_size is None:
+            args.vocab_size = 50257 if args.train.suffix == ".pt" else 256
         train(args)
     else:
         args.lags = sorted(set(args.lags))
