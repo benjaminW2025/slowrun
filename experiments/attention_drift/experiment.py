@@ -98,7 +98,7 @@ class Transformer(nn.Module):
             for block in self.blocks:
                 block.split_mlp()
 
-    def forward(self, tokens, query_positions=None):
+    def forward(self, tokens, query_positions=None, *, return_states=False):
         positions = torch.arange(tokens.size(1), device=tokens.device)
         x = self.tokens(tokens) + self.positions(positions)
         maps = []
@@ -108,11 +108,14 @@ class Transformer(nn.Module):
                 maps.append(probabilities.cpu())
         x = self.norm(x)
         if self.classifier_norm is None:
-            return self.output(x), maps
-        # Normalize each token state and each classifier row independently.
-        x = F.normalize(x, dim=-1) * self.classifier_norm
-        weight = F.normalize(self.output.weight, dim=-1) * self.classifier_norm
-        return F.linear(x, weight), maps
+            logits = self.output(x)
+        else:
+            x = F.normalize(x, dim=-1)
+            weight = F.normalize(self.output.weight, dim=-1)
+            logits = F.linear(x * self.classifier_norm, weight * self.classifier_norm)
+        if return_states:
+            return logits, maps, x
+        return logits, maps
 
 
 def load_tokens(path, vocab_size):
@@ -152,16 +155,44 @@ def token_loss(logits, targets):
 
 @torch.inference_mode()
 def evaluate(model, tokens, starts, context, batch_size, device):
-    losses = [
-        token_loss(*eval_batch(model, tokens, batch, context, device)).item() * len(batch)
-        for batch in np.array_split(starts, math.ceil(len(starts) / batch_size))
-    ]
-    return sum(losses) / len(starts)
-
-
-def eval_batch(model, tokens, starts, context, device):
-    inputs, targets = read_windows(tokens, starts, context, device)
-    return model(inputs)[0], targets
+    measure_geometry = model.classifier_norm is not None
+    loss_sum = correct = cosine_sum = 0.0
+    if measure_geometry:
+        # Aggregate on CPU to avoid nondeterministic GPU scatter reductions.
+        sums = torch.zeros_like(model.tokens.weight, device="cpu")
+        counts = torch.zeros(sums.size(0), dtype=torch.long)
+        norm_sq_sums = torch.zeros(sums.size(0), dtype=sums.dtype)
+    for batch in np.array_split(starts, math.ceil(len(starts) / batch_size)):
+        inputs, targets = read_windows(tokens, batch, context, device)
+        if measure_geometry:
+            logits, _, states = model(inputs, return_states=True)
+            correct += (logits.argmax(-1) == targets).sum().item()
+            target_logits = logits.gather(-1, targets.unsqueeze(-1)).sum().item()
+            cosine_sum += target_logits / model.classifier_norm**2
+            labels = targets.flatten().cpu()
+            states = states.flatten(0, 1).cpu()
+            sums.index_add_(0, labels, states)
+            counts += torch.bincount(labels, minlength=counts.numel())
+            norm_sq_sums.index_add_(0, labels, states.square().sum(-1))
+        else:
+            logits, _ = model(inputs)
+        loss_sum += token_loss(logits, targets).item() * len(batch)
+    metrics = {"validation_loss": loss_sum / len(starts)}
+    if measure_geometry:
+        total = len(starts) * context
+        repeated = counts > 1
+        n = counts[repeated].double()
+        # The squared sum includes self-pairs. Subtract their contribution.
+        pair_cosines = (
+            sums[repeated].double().square().sum(-1) - norm_sq_sums[repeated]
+        ) / (n * (n - 1))
+        metrics.update(
+            validation_top1=correct / total,
+            validation_target_cosine=cosine_sum / total,
+            validation_within_token_cosine=pair_cosines.mean().item() if n.numel() else None,
+            validation_repeated_token_types=n.numel(),
+        )
+    return metrics
 
 
 def fingerprint(path):
@@ -202,6 +233,8 @@ def train(args):
         if "training_state" not in checkpoint:
             raise ValueError("Resume requires a checkpoint created with --fork-at")
         state = checkpoint["training_state"]
+        if state["config"].get("alignment_weight", 0.0) != args.alignment_weight:
+            raise ValueError("Resume configuration differs for alignment_weight")
         if state["config"].get("classifier_norm") != args.classifier_norm:
             raise ValueError("Resume configuration differs for classifier_norm")
         if state["config"].get("mlp_depth", 1) != args.mlp_depth:
@@ -229,12 +262,11 @@ def train(args):
 
     def save(step, lr):
         model.eval()
-        loss = evaluate(model, val_tokens, starts, args.context, args.batch_size, device)
         metrics = {
             "step": step,
             "tokens_seen": step * args.batch_size * args.context,
             "lr": lr,
-            "validation_loss": loss,
+            **evaluate(model, val_tokens, starts, args.context, args.batch_size, device),
         }
         target = args.out / f"step-{step:08d}.pt"
         temporary = target.with_suffix(".tmp")
@@ -258,7 +290,12 @@ def train(args):
         inputs, targets = read_windows(train_tokens, offsets, args.context, device)
         optimizer.zero_grad(set_to_none=True)
         logits, _ = model(inputs)
-        token_loss(logits, targets).backward()
+        loss = token_loss(logits, targets)
+        if args.alignment_weight:
+            target_logits = logits.gather(-1, targets.unsqueeze(-1))
+            target_cosine = target_logits.mean() / args.classifier_norm**2
+            loss = loss + args.alignment_weight * (1 - target_cosine)
+        loss.backward()
         if frozen_qk is not None:
             qkv.grad[: 2 * args.width].zero_()
         optimizer.step()
@@ -382,6 +419,8 @@ def main():
     training.add_argument("--vocab-size", type=positive)
     training.add_argument("--classifier-norm", type=float,
                           help="Fixed L2 norm for final token vectors and classifier rows")
+    training.add_argument("--alignment-weight", type=float, default=0.0,
+                          help="Training-only weight on 1 minus target cosine similarity")
     training.add_argument("--mlp-depth", type=int, choices=(1, 2), default=1,
                           help="Number of residual MLPs per attention block")
     training.add_argument("--fork-at", type=positive, nargs="+", default=[])
@@ -410,6 +449,10 @@ def main():
             not math.isfinite(args.classifier_norm) or args.classifier_norm <= 0
         ):
             parser.error("--classifier-norm must be finite and positive")
+        if not math.isfinite(args.alignment_weight) or args.alignment_weight < 0:
+            parser.error("--alignment-weight must be finite and nonnegative")
+        if args.alignment_weight and args.classifier_norm is None:
+            parser.error("--alignment-weight requires --classifier-norm")
         if args.context < 2 or not math.isfinite(args.lr) or args.lr <= 0:
             parser.error("training requires context >= 2 and a finite positive learning rate")
         if args.freeze_layer0_qk and args.resume is None:

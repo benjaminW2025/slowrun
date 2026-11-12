@@ -96,3 +96,24 @@ Omit the flag for the original head.
 python experiment.py train --out runs/unit-head --classifier-norm 1 \
   --batch-size 4 --steps 6000 --device cuda
 ```
+
+## Target cosine alignment
+
+Compare two cosine heads with the same fixed classifier norm and identical
+training settings. The second run adds 0.1 × (1 − target cosine) to the
+training objective. The target cosine comes from the correct token's logit
+divided by the squared classifier norm.
+
+```sh
+python -u experiment.py train --out runs/cos-ce --classifier-norm 1 \
+  --batch-size 4 --steps 6000 --device cuda
+python -u experiment.py train --out runs/cos-align --classifier-norm 1 \
+  --alignment-weight 0.1 --batch-size 4 --steps 6000 --device cuda
+```
+
+Both runs report plain cross-entropy as `validation_loss`. For cosine heads,
+check `validation_top1`, `validation_target_cosine`, and
+`validation_within_token_cosine` at matched checkpoints. The last metric
+averages the cosine of distinct pairs of validation states with the same
+target token, giving each repeated target type equal weight. Its coverage
+is reported as `validation_repeated_token_types`.
