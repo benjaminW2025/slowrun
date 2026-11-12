@@ -60,3 +60,24 @@ To compare the entire loss trajectory, run `python compare_freeze.py` after
 the freeze runs. The output is CSV and includes the shared starting checkpoint
 and every later step present in both the branch and the control. Use
 `python compare_freeze.py > runs/freeze-comparison.csv` to save a copy.
+
+## MLP depth at fixed linear compute
+
+From the same initial seed, compare one 4× GELU MLP against two sequential 2×
+GELU MLPs per block. Each narrow MLP has its own pre-norm and residual. The two
+variants have identical initial attention and embedding weights and the same
+total MLP linear weight count. The deep variant starts from the two halves of
+the shallow variant's initialized linear weights. It adds a LayerNorm, a
+residual addition, and an output bias vector per block, so exact FLOPs and
+wall time can differ.
+
+```sh
+python experiment.py train --out runs/mlp-1 --mlp-depth 1 --batch-size 4 \
+  --steps 6000 --device cuda
+python experiment.py train --out runs/mlp-2 --mlp-depth 2 --batch-size 4 \
+  --steps 6000 --device cuda
+```
+
+Compare the printed validation losses at step 6,000 and at earlier matched
+steps. Both runs see the same data in the same order. Attention capacity is
+fixed for this experiment.

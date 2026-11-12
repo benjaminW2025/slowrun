@@ -48,10 +48,32 @@ class Block(nn.Module):
             nn.Linear(width, 4 * width), nn.GELU(), nn.Linear(4 * width, width)
         )
 
+    @torch.no_grad()
+    def split_mlp(self):
+        # Start both architectures with the same linear weights and biases.
+        # The two halves now act sequentially, each with its own residual.
+        up, _, down = self.mlp
+        width = up.in_features
+        hidden = up.out_features // 2
+        halves = []
+        for rows in (slice(0, hidden), slice(hidden, None)):
+            narrow_up = nn.Linear(width, hidden)
+            narrow_down = nn.Linear(hidden, width)
+            narrow_up.weight.copy_(up.weight[rows])
+            narrow_up.bias.copy_(up.bias[rows])
+            narrow_down.weight.copy_(down.weight[:, rows])
+            narrow_down.bias.copy_(down.bias / 2)
+            halves.append(nn.Sequential(narrow_up, nn.GELU(), narrow_down))
+        self.mlp, self.second_mlp = halves
+        self.second_mlp_norm = nn.LayerNorm(width)
+
     def forward(self, x, query_positions):
         attention, probabilities = self.attention(self.attention_norm(x), query_positions)
         x = x + attention
-        return x + self.mlp(self.mlp_norm(x)), probabilities
+        x = x + self.mlp(self.mlp_norm(x))
+        if hasattr(self, "second_mlp"):
+            x = x + self.second_mlp(self.second_mlp_norm(x))
+        return x, probabilities
 
 
 class Transformer(nn.Module):
@@ -71,6 +93,9 @@ class Transformer(nn.Module):
                 if isinstance(module, nn.Linear) and module.bias is not None:
                     nn.init.zeros_(module.bias)
         self.output.weight = self.tokens.weight
+        if config.get("mlp_depth", 1) == 2:
+            for block in self.blocks:
+                block.split_mlp()
 
     def forward(self, tokens, query_positions=None):
         positions = torch.arange(tokens.size(1), device=tokens.device)
@@ -170,6 +195,8 @@ def train(args):
         if "training_state" not in checkpoint:
             raise ValueError("Resume requires a checkpoint created with --fork-at")
         state = checkpoint["training_state"]
+        if state["config"].get("mlp_depth", 1) != args.mlp_depth:
+            raise ValueError("Resume configuration differs for mlp_depth")
         for key in (
             "width", "heads", "layers", "context", "vocab_size", "batch_size",
             "seed", "data_seed", "lr", "warmup", "val_windows", "train_sha256", "val_sha256",
@@ -344,6 +371,8 @@ def main():
     training.add_argument("--val", type=Path, default=data_dir / "fineweb_val.pt")
     training.add_argument("--out", type=Path, required=True)
     training.add_argument("--vocab-size", type=positive)
+    training.add_argument("--mlp-depth", type=int, choices=(1, 2), default=1,
+                          help="Number of residual MLPs per attention block")
     training.add_argument("--fork-at", type=positive, nargs="+", default=[])
     training.add_argument("--resume", type=Path)
     training.add_argument("--freeze-layer0-qk", action="store_true")
