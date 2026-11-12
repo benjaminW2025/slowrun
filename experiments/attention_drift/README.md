@@ -81,3 +81,18 @@ python experiment.py train --out runs/mlp-2 --mlp-depth 2 --batch-size 4 \
 Compare the printed validation losses at step 6,000 and at earlier matched
 steps. Both runs see the same data in the same order. Attention capacity is
 fixed for this experiment.
+
+## Fixed-norm classifier
+
+Use `--classifier-norm 1` to normalize each final token vector after the
+final LayerNorm, and each output classifier row, to unit L2 norm. Logits are
+their raw dot products, with no learned scale. The classifier still shares
+its underlying weights with the input embedding table. The input lookup
+uses those weights directly, and row normalization applies on the classifier
+side. With a shared norm of r, logits are r² times cosine similarity.
+Omit the flag for the original head.
+
+```sh
+python experiment.py train --out runs/unit-head --classifier-norm 1 \
+  --batch-size 4 --steps 6000 --device cuda
+```

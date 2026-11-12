@@ -93,6 +93,7 @@ class Transformer(nn.Module):
                 if isinstance(module, nn.Linear) and module.bias is not None:
                     nn.init.zeros_(module.bias)
         self.output.weight = self.tokens.weight
+        self.classifier_norm = config.get("classifier_norm")
         if config.get("mlp_depth", 1) == 2:
             for block in self.blocks:
                 block.split_mlp()
@@ -105,7 +106,13 @@ class Transformer(nn.Module):
             x, probabilities = block(x, query_positions)
             if probabilities is not None:
                 maps.append(probabilities.cpu())
-        return self.output(self.norm(x)), maps
+        x = self.norm(x)
+        if self.classifier_norm is None:
+            return self.output(x), maps
+        # Normalize each token state and each classifier row independently.
+        x = F.normalize(x, dim=-1) * self.classifier_norm
+        weight = F.normalize(self.output.weight, dim=-1) * self.classifier_norm
+        return F.linear(x, weight), maps
 
 
 def load_tokens(path, vocab_size):
@@ -195,6 +202,8 @@ def train(args):
         if "training_state" not in checkpoint:
             raise ValueError("Resume requires a checkpoint created with --fork-at")
         state = checkpoint["training_state"]
+        if state["config"].get("classifier_norm") != args.classifier_norm:
+            raise ValueError("Resume configuration differs for classifier_norm")
         if state["config"].get("mlp_depth", 1) != args.mlp_depth:
             raise ValueError("Resume configuration differs for mlp_depth")
         for key in (
@@ -371,6 +380,8 @@ def main():
     training.add_argument("--val", type=Path, default=data_dir / "fineweb_val.pt")
     training.add_argument("--out", type=Path, required=True)
     training.add_argument("--vocab-size", type=positive)
+    training.add_argument("--classifier-norm", type=float,
+                          help="Fixed L2 norm for final token vectors and classifier rows")
     training.add_argument("--mlp-depth", type=int, choices=(1, 2), default=1,
                           help="Number of residual MLPs per attention block")
     training.add_argument("--fork-at", type=positive, nargs="+", default=[])
@@ -395,6 +406,10 @@ def main():
     analysis.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
     if args.command == "train":
+        if args.classifier_norm is not None and (
+            not math.isfinite(args.classifier_norm) or args.classifier_norm <= 0
+        ):
+            parser.error("--classifier-norm must be finite and positive")
         if args.context < 2 or not math.isfinite(args.lr) or args.lr <= 0:
             parser.error("training requires context >= 2 and a finite positive learning rate")
         if args.freeze_layer0_qk and args.resume is None:
