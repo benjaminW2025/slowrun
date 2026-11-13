@@ -269,3 +269,17 @@ python -u experiment.py train --untie-embeddings \
 For paired timing, rerun the same command without `--triton-split-qkv`
 and with a fresh output directory on the same GPU. Subtract
 `training_seconds` at 4,250 from 4,500 for each arm.
+
+### Evaluate an earlier output projection
+
+After the per-layer output projection freeze sweep, run:
+
+```sh
+python compare_o_swap.py --device cuda
+```
+
+For seeds 1–3 and blocks 0, 3, and 5, evaluate the 8k control, the 8k
+control with just that block's 4k W_O restored, and the matching model
+trained with that W_O frozen from 4k. All three use the control's original
+validation windows. The two deltas subtract the reevaluated control loss.
+No training or checkpoint writes occur.
