@@ -250,3 +250,22 @@ Compare training time between steps 4,250 and 4,500. Split versus packed
 measures the cost of the split layout. Frozen versus split isolates the
 effect of skipping QK gradients and updates. Frozen versus packed measures
 the net speed change against the original trainer.
+
+### Triton split QKV proof of concept
+
+On a CUDA machine with Triton installed, run `python check_triton_qkv.py`
+before timing. The optional backend reads separate QK and V weights
+without concatenating them in the forward or input-gradient matmul.
+Trainable weight gradients still use PyTorch matmuls. The Triton kernels
+use IEEE precision for FP32, with fixed tile sizes for this first version.
+
+```sh
+python -u experiment.py train --untie-embeddings \
+  --resume runs/untied-prefix/base/step-00004000.pt \
+  --out runs/qk-split/triton-frozen --batch-size 4 --steps 4500 --device cuda \
+  --split-qkv-layers 0 1 --freeze-qk-layers 0 1 --triton-split-qkv
+```
+
+For paired timing, rerun the same command without `--triton-split-qkv`
+and with a fresh output directory on the same GPU. Subtract
+`training_seconds` at 4,250 from 4,500 for each arm.

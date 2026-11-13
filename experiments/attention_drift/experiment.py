@@ -67,6 +67,7 @@ class Attention(nn.Module):
         super().__init__()
         self.heads = heads
         self.skip_qk_weight_grad = False
+        self.split_projection_op = PackedSplitQKV
         self.qkv = nn.Linear(width, 3 * width, bias=False)
         self.output = nn.Linear(width, width, bias=False)
 
@@ -83,7 +84,7 @@ class Attention(nn.Module):
     def forward(self, x, query_positions=None):
         batch, length, width = x.shape
         if hasattr(self, "qk_weight"):
-            projected = PackedSplitQKV.apply(x, self.qk_weight, self.v_weight)
+            projected = self.split_projection_op.apply(x, self.qk_weight, self.v_weight)
         elif self.skip_qk_weight_grad and torch.is_grad_enabled():
             projected = FrozenQKProjection.apply(x, self.qkv.weight)
         else:
@@ -357,6 +358,12 @@ def train(args):
     if source_layout != args.split_qkv_layers:
         optimizer = split_qkv_with_optimizer(model, optimizer, args.split_qkv_layers)
 
+    if args.triton_split_qkv:
+        from triton_qkv import TritonSplitQKV
+
+        for layer in args.split_qkv_layers:
+            model.blocks[layer].attention.split_projection_op = TritonSplitQKV
+
     for layer in args.freeze_o_layers:
         model.blocks[layer].attention.output.requires_grad_(False)
     if args.freeze_prefix is not None:
@@ -571,6 +578,8 @@ def main():
                            help="Freeze Q/K weights in the listed zero-based blocks")
     training.add_argument("--split-qkv-layers", type=int, nargs="+", default=[],
                           help="Use separate QK and V parameters with a packed forward GEMM")
+    training.add_argument("--triton-split-qkv", action="store_true",
+                          help="Use Triton for split QKV forward and input gradients")
     training.add_argument("--skip-frozen-qk-grad", action="store_true",
                           help="Compute only the V weight gradient in Q/K-frozen blocks")
     training.add_argument("--freeze-o-layers", type=int, nargs="+", default=[],
@@ -614,6 +623,10 @@ def main():
         args.split_qkv_layers = sorted(set(args.split_qkv_layers))
         if any(layer < 0 or layer >= args.layers for layer in args.split_qkv_layers):
             parser.error("--split-qkv-layers indices must be in [0, --layers)")
+        if args.triton_split_qkv and (
+            not args.split_qkv_layers or torch.device(args.device).type != "cuda"
+        ):
+            parser.error("--triton-split-qkv requires --split-qkv-layers and CUDA")
         if args.skip_frozen_qk_grad and set(args.split_qkv_layers) & set(args.freeze_qk_layers):
             parser.error("Split Q/K freezing already skips its weight gradient")
         if args.skip_frozen_qk_grad and not args.freeze_qk_layers:
