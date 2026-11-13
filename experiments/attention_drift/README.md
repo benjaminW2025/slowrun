@@ -186,3 +186,24 @@ done
 If both individual freezes have small penalties, use `--freeze-qk-layers 0 1`
 with a new output directory to test the joint freeze. These runs measure loss.
 The packed QKV projection still computes its full gradient.
+
+### Benchmark Q/K freezing with weight-gradient savings
+
+Run these sequentially on the same GPU. Both arms reuse the untied 4k
+checkpoint and keep packed QKV weights. The frozen arm computes the input
+gradient through Q/K/V and only the V rows of the weight-gradient matmul.
+The packed AdamW update still runs and frozen rows are restored afterward.
+
+```sh
+python -u experiment.py train --untie-embeddings \
+  --resume runs/untied-prefix/base/step-00004000.pt \
+  --out runs/qk-speed/control --batch-size 4 --steps 4500 --device cuda
+python -u experiment.py train --untie-embeddings \
+  --resume runs/untied-prefix/base/step-00004000.pt \
+  --out runs/qk-speed/both --freeze-qk-layers 0 1 --skip-frozen-qk-grad \
+  --batch-size 4 --steps 4500 --device cuda
+```
+
+Subtract each arm's cumulative `training_seconds` at step 4,250 from its
+value at 4,500 to exclude the first 250 steps from the timing. Repeat in
+reverse order with new output directories if the timing difference is small.

@@ -14,18 +14,44 @@ from torch import nn
 from torch.nn import functional as F
 
 
+class FrozenQKProjection(torch.autograd.Function):
+    """Packed QKV projection whose weight gradient only computes the V rows."""
+
+    @staticmethod
+    def forward(ctx, x, weight):
+        ctx.save_for_backward(x, weight)
+        return F.linear(x, weight)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, weight = ctx.saved_tensors
+        width = x.size(-1)
+        grad_input = grad_output @ weight if ctx.needs_input_grad[0] else None
+        grad_weight = None
+        if ctx.needs_input_grad[1]:
+            grad_v = grad_output[..., 2 * width:].reshape(-1, width)
+            grad_weight = torch.zeros_like(weight)
+            grad_weight[2 * width:] = grad_v.T @ x.reshape(-1, width)
+        return grad_input, grad_weight
+
+
 class Attention(nn.Module):
     def __init__(self, width, heads):
         super().__init__()
         self.heads = heads
+        self.skip_qk_weight_grad = False
         self.qkv = nn.Linear(width, 3 * width, bias=False)
         self.output = nn.Linear(width, width, bias=False)
 
     def forward(self, x, query_positions=None):
         batch, length, width = x.shape
+        projected = (
+            FrozenQKProjection.apply(x, self.qkv.weight)
+            if self.skip_qk_weight_grad and torch.is_grad_enabled()
+            else self.qkv(x)
+        )
         q, k, v = (
-            self.qkv(x)
-            .reshape(batch, length, 3, self.heads, width // self.heads)
+            projected.reshape(batch, length, 3, self.heads, width // self.heads)
             .permute(2, 0, 3, 1, 4)
             .unbind()
         )
@@ -270,7 +296,9 @@ def train(args):
     qk_rows = slice(0, 2 * args.width)
     frozen_qk = []
     for layer in args.freeze_qk_layers:
-        qkv = model.blocks[layer].attention.qkv.weight
+        attention = model.blocks[layer].attention
+        attention.skip_qk_weight_grad = args.skip_frozen_qk_grad
+        qkv = attention.qkv.weight
         frozen_qk.append((qkv, qkv[qk_rows].detach().clone()))
     args.out.mkdir(parents=True, exist_ok=False)
     (args.out / "config.json").write_text(json.dumps(config, indent=2) + "\n")
@@ -322,8 +350,9 @@ def train(args):
             target_cosine = target_logits.mean() / args.classifier_norm**2
             loss = loss + args.alignment_weight * (1 - target_cosine)
         loss.backward()
-        for qkv, _ in frozen_qk:
-            qkv.grad[qk_rows].zero_()
+        if not args.skip_frozen_qk_grad:
+            for qkv, _ in frozen_qk:
+                qkv.grad[qk_rows].zero_()
         optimizer.step()
         # AdamW momentum and weight decay can still move zero-gradient rows.
         with torch.no_grad():
@@ -461,6 +490,8 @@ def main():
     freeze_qk.add_argument("--freeze-layer0-qk", action="store_true")
     freeze_qk.add_argument("--freeze-qk-layers", type=int, nargs="+", default=[],
                            help="Freeze Q/K weights in the listed zero-based blocks")
+    training.add_argument("--skip-frozen-qk-grad", action="store_true",
+                          help="Compute only the V weight gradient in Q/K-frozen blocks")
     training.add_argument("--freeze-prefix", type=int, choices=(0, 1),
                           help="Freeze embeddings and this many initial blocks (0 or 1)")
     for name, default in {
@@ -497,6 +528,8 @@ def main():
         args.freeze_qk_layers = sorted(set(args.freeze_qk_layers))
         if any(layer < 0 or layer >= args.layers for layer in args.freeze_qk_layers):
             parser.error("--freeze-qk-layers indices must be in [0, --layers)")
+        if args.skip_frozen_qk_grad and not args.freeze_qk_layers:
+            parser.error("--skip-frozen-qk-grad requires a Q/K freeze")
         if args.freeze_qk_layers and args.freeze_prefix is not None:
             parser.error("Choose one freeze intervention")
         if args.freeze_qk_layers or args.freeze_prefix is not None:
