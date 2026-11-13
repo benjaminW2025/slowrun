@@ -225,3 +225,28 @@ python -u experiment.py train --untie-embeddings \
 Compare validation loss with the existing untied control at the same step.
 For a timing comparison, use the same idle GPU and measure the same
 steady-state intervals in a fresh control and frozen run.
+
+### Benchmark packed forward with separate QK and V parameters
+
+These three arms resume the same untied 4k checkpoint. Run them sequentially
+on the same GPU. The two split arms concatenate QK and V weights before
+one forward GEMM. The trainer splits the saved AdamW moments along with
+the weights. The split freeze arm computes V weight gradients and full
+input gradients, and AdamW skips QK.
+
+```sh
+for arm in packed split frozen; do
+  flags=()
+  if [ "$arm" != packed ]; then flags+=(--split-qkv-layers 0 1); fi
+  if [ "$arm" = frozen ]; then flags+=(--freeze-qk-layers 0 1); fi
+  python -u experiment.py train --untie-embeddings \
+    --resume runs/untied-prefix/base/step-00004000.pt \
+    --out "runs/qk-split/$arm" --batch-size 4 --steps 4500 --device cuda \
+    "${flags[@]}" || break
+done
+```
+
+Compare training time between steps 4,250 and 4,500. Split versus packed
+measures the cost of the split layout. Frozen versus split isolates the
+effect of skipping QK gradients and updates. Frozen versus packed measures
+the net speed change against the original trainer.

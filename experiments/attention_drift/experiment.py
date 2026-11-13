@@ -35,6 +35,33 @@ class FrozenQKProjection(torch.autograd.Function):
         return grad_input, grad_weight
 
 
+class PackedSplitQKV(torch.autograd.Function):
+    """One forward GEMM with independently trainable QK and V weights."""
+
+    @staticmethod
+    def forward(ctx, x, qk, v):
+        weight = torch.cat((qk, v), dim=0)
+        ctx.save_for_backward(x, weight)
+        return F.linear(x, weight)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, weight = ctx.saved_tensors
+        width = x.size(-1)
+        grad_input = grad_output @ weight if ctx.needs_input_grad[0] else None
+        grad_qk = grad_v = None
+        if ctx.needs_input_grad[1] or ctx.needs_input_grad[2]:
+            grad = grad_output.reshape(-1, 3 * width)
+            inputs = x.reshape(-1, width)
+            if ctx.needs_input_grad[1] and ctx.needs_input_grad[2]:
+                grad_qk, grad_v = (grad.T @ inputs).split((2 * width, width))
+            elif ctx.needs_input_grad[1]:
+                grad_qk = grad[:, :2 * width].T @ inputs
+            else:
+                grad_v = grad[:, 2 * width:].T @ inputs
+        return grad_input, grad_qk, grad_v
+
+
 class Attention(nn.Module):
     def __init__(self, width, heads):
         super().__init__()
@@ -43,13 +70,24 @@ class Attention(nn.Module):
         self.qkv = nn.Linear(width, 3 * width, bias=False)
         self.output = nn.Linear(width, width, bias=False)
 
+    def split_projection(self):
+        packed = self.qkv.weight
+        width = packed.size(1)
+        self.qk_weight, self.v_weight = (
+            nn.Parameter(part.detach().clone())
+            for part in packed.split((2 * width, width))
+        )
+        del self.qkv
+        return packed
+
     def forward(self, x, query_positions=None):
         batch, length, width = x.shape
-        projected = (
-            FrozenQKProjection.apply(x, self.qkv.weight)
-            if self.skip_qk_weight_grad and torch.is_grad_enabled()
-            else self.qkv(x)
-        )
+        if hasattr(self, "qk_weight"):
+            projected = PackedSplitQKV.apply(x, self.qk_weight, self.v_weight)
+        elif self.skip_qk_weight_grad and torch.is_grad_enabled():
+            projected = FrozenQKProjection.apply(x, self.qkv.weight)
+        else:
+            projected = self.qkv(x)
         q, k, v = (
             projected.reshape(batch, length, 3, self.heads, width // self.heads)
             .permute(2, 0, 3, 1, 4)
@@ -125,6 +163,9 @@ class Transformer(nn.Module):
         if config.get("mlp_depth", 1) == 2:
             for block in self.blocks:
                 block.split_mlp()
+
+        for layer in config.get("split_qkv_layers", []):
+            self.blocks[layer].attention.split_projection()
 
     def forward(self, tokens, query_positions=None, *, return_states=False):
         positions = torch.arange(tokens.size(1), device=tokens.device)
@@ -228,6 +269,30 @@ def fingerprint(path):
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
+def split_qkv_with_optimizer(model, optimizer, layers):
+    """Convert packed projections after restoring their AdamW state."""
+    states = dict(optimizer.state)
+    for layer in layers:
+        attention = model.blocks[layer].attention
+        packed = attention.split_projection()
+        packed_state = states.pop(packed, None)
+        if packed_state is None:
+            continue
+        width = packed.size(1)
+        for param, rows in (
+            (attention.qk_weight, slice(0, 2 * width)),
+            (attention.v_weight, slice(2 * width, None)),
+        ):
+            states[param] = {
+                key: value[rows].clone() if key != "step" else value.clone()
+                for key, value in packed_state.items()
+            }
+    options = {key: value for key, value in optimizer.param_groups[0].items() if key != "params"}
+    converted = torch.optim.AdamW([dict(options, params=list(model.parameters()))])
+    converted.state.update(states)
+    return converted
+
+
 def train(args):
     config = vars(args).copy()
     config.pop("command")
@@ -251,15 +316,21 @@ def train(args):
     device = torch.device(args.device)
     starts = validation_starts(val_tokens, args.context, args.val_windows, args.data_seed)
     torch.manual_seed(args.seed)
-    model = Transformer(config).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
-    sampler = np.random.default_rng(args.data_seed)
-    start_step = 0
-    start_lr = 0.0
+    checkpoint = None
+    source_layout = args.split_qkv_layers
     if args.resume:
         checkpoint = torch.load(args.resume, map_location="cpu", weights_only=True)
         if "training_state" not in checkpoint:
             raise ValueError("Resume requires a checkpoint created with --fork-at")
+        source_layout = checkpoint["training_state"]["config"].get("split_qkv_layers", [])
+        if source_layout and source_layout != args.split_qkv_layers:
+            raise ValueError("Resume must keep the checkpoint's split QKV layers")
+    model = Transformer(dict(config, split_qkv_layers=source_layout)).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    sampler = np.random.default_rng(args.data_seed)
+    start_step = 0
+    start_lr = 0.0
+    if checkpoint is not None:
         state = checkpoint["training_state"]
         if state["config"].get("untie_embeddings", False) != args.untie_embeddings:
             raise ValueError("Resume configuration differs for untie_embeddings")
@@ -283,6 +354,9 @@ def train(args):
         start_step = checkpoint["metrics"]["step"]
         start_lr = checkpoint["metrics"]["lr"]
 
+    if source_layout != args.split_qkv_layers:
+        optimizer = split_qkv_with_optimizer(model, optimizer, args.split_qkv_layers)
+
     for layer in args.freeze_o_layers:
         model.blocks[layer].attention.output.requires_grad_(False)
     if args.freeze_prefix is not None:
@@ -299,6 +373,9 @@ def train(args):
     frozen_qk = []
     for layer in args.freeze_qk_layers:
         attention = model.blocks[layer].attention
+        if layer in args.split_qkv_layers:
+            attention.qk_weight.requires_grad_(False)
+            continue
         attention.skip_qk_weight_grad = args.skip_frozen_qk_grad
         qkv = attention.qkv.weight
         frozen_qk.append((qkv, qkv[qk_rows].detach().clone()))
@@ -492,6 +569,8 @@ def main():
     freeze_qk.add_argument("--freeze-layer0-qk", action="store_true")
     freeze_qk.add_argument("--freeze-qk-layers", type=int, nargs="+", default=[],
                            help="Freeze Q/K weights in the listed zero-based blocks")
+    training.add_argument("--split-qkv-layers", type=int, nargs="+", default=[],
+                          help="Use separate QK and V parameters with a packed forward GEMM")
     training.add_argument("--skip-frozen-qk-grad", action="store_true",
                           help="Compute only the V weight gradient in Q/K-frozen blocks")
     training.add_argument("--freeze-o-layers", type=int, nargs="+", default=[],
@@ -532,6 +611,11 @@ def main():
         args.freeze_qk_layers = sorted(set(args.freeze_qk_layers))
         if any(layer < 0 or layer >= args.layers for layer in args.freeze_qk_layers):
             parser.error("--freeze-qk-layers indices must be in [0, --layers)")
+        args.split_qkv_layers = sorted(set(args.split_qkv_layers))
+        if any(layer < 0 or layer >= args.layers for layer in args.split_qkv_layers):
+            parser.error("--split-qkv-layers indices must be in [0, --layers)")
+        if args.skip_frozen_qk_grad and set(args.split_qkv_layers) & set(args.freeze_qk_layers):
+            parser.error("Split Q/K freezing already skips its weight gradient")
         if args.skip_frozen_qk_grad and not args.freeze_qk_layers:
             parser.error("--skip-frozen-qk-grad requires a Q/K freeze")
         args.freeze_o_layers = sorted(set(args.freeze_o_layers))
