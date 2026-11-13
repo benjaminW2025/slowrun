@@ -117,3 +117,32 @@ check `validation_top1`, `validation_target_cosine`, and
 averages the cosine of distinct pairs of validation states with the same
 target token, giving each repeated target type equal weight. Its coverage
 is reported as `validation_repeated_token_types`.
+
+## Prefix freeze and time to validation loss
+
+Resume all three arms from the same original, unfrozen step-4,000 checkpoint.
+Use the same GPU model and comparable load for timing. If using one GPU, run
+the commands sequentially. Keep any data path overrides from the original run.
+
+```sh
+resume=runs/freeze-control/step-00004000.pt
+python -u experiment.py train --resume "$resume" --out runs/prefix/control \
+  --batch-size 4 --steps 8000 --device cuda
+python -u experiment.py train --resume "$resume" --out runs/prefix/embeddings \
+  --freeze-prefix 0 --batch-size 4 --steps 8000 --device cuda
+python -u experiment.py train --resume "$resume" --out runs/prefix/block0 \
+  --freeze-prefix 1 --batch-size 4 --steps 8000 --device cuda
+python compare_prefix.py --target 5.90
+```
+
+Both freeze arms freeze token and positional embeddings. In this pilot the
+token matrix is tied to the output head, so both arms also freeze the
+classifier weights. The classifier still backpropagates into its inputs.
+The second freeze arm additionally freezes block 0. Its output has no
+autograd history, so backward starts at the first trainable block.
+
+The target of 5.90 nats is based on the earlier control crossing it between
+steps 6,750 and 7,000. The comparison uses the first saved checkpoint at or
+below that target. Training timings include batch loading and optimizer work,
+and exclude validation, checkpoint writes, and setup. The final loss and
+mean milliseconds per update use the full matched continuation.

@@ -5,6 +5,7 @@ import csv
 import hashlib
 import json
 import math
+import time
 from pathlib import Path
 
 import numpy as np
@@ -253,6 +254,15 @@ def train(args):
         start_step = checkpoint["metrics"]["step"]
         start_lr = checkpoint["metrics"]["lr"]
 
+    if args.freeze_prefix is not None:
+        # The token lookup and output classifier share a parameter.
+        model.tokens.requires_grad_(False)
+        model.positions.requires_grad_(False)
+        for block in model.blocks[:args.freeze_prefix]:
+            block.requires_grad_(False)
+        # Keep the optimizer's parameter groups compatible with the checkpoint.
+        # AdamW skips frozen parameters because their gradients remain None.
+
     early_steps = {2**power for power in range(8)}
     qkv = model.blocks[0].attention.qkv.weight
     qk = qkv[: 2 * args.width]
@@ -260,12 +270,21 @@ def train(args):
     args.out.mkdir(parents=True, exist_ok=False)
     (args.out / "config.json").write_text(json.dumps(config, indent=2) + "\n")
 
+    training_seconds = 0.0
+
+    def sync_device():
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        elif device.type == "mps":
+            torch.mps.synchronize()
+
     def save(step, lr):
         model.eval()
         metrics = {
             "step": step,
             "tokens_seen": step * args.batch_size * args.context,
             "lr": lr,
+            "training_seconds": training_seconds,
             **evaluate(model, val_tokens, starts, args.context, args.batch_size, device),
         }
         target = args.out / f"step-{step:08d}.pt"
@@ -283,6 +302,8 @@ def train(args):
         model.train()
 
     save(start_step, start_lr)
+    sync_device()
+    interval_start = time.perf_counter()
     for step in range(start_step + 1, args.steps + 1):
         lr = args.lr * min(1.0, step / max(1, args.warmup))
         optimizer.param_groups[0]["lr"] = lr
@@ -304,7 +325,11 @@ def train(args):
             with torch.no_grad():
                 qk.copy_(frozen_qk)
         if step in early_steps or step in args.fork_at or step % args.save_every == 0 or step == args.steps:
+            sync_device()
+            training_seconds += time.perf_counter() - interval_start
             save(step, lr)
+            sync_device()
+            interval_start = time.perf_counter()
 
 
 @torch.inference_mode()
@@ -426,6 +451,8 @@ def main():
     training.add_argument("--fork-at", type=positive, nargs="+", default=[])
     training.add_argument("--resume", type=Path)
     training.add_argument("--freeze-layer0-qk", action="store_true")
+    training.add_argument("--freeze-prefix", type=int, choices=(0, 1),
+                          help="Freeze embeddings and this many initial blocks (0 or 1)")
     for name, default in {
         "steps": 12000, "save-every": 250, "warmup": 200, "batch-size": 16,
         "context": 256, "width": 192, "heads": 6, "layers": 6,
@@ -455,10 +482,13 @@ def main():
             parser.error("--alignment-weight requires --classifier-norm")
         if args.context < 2 or not math.isfinite(args.lr) or args.lr <= 0:
             parser.error("training requires context >= 2 and a finite positive learning rate")
-        if args.freeze_layer0_qk and args.resume is None:
-            parser.error("--freeze-layer0-qk requires --resume")
-        if args.freeze_layer0_qk and args.fork_at:
-            parser.error("--fork-at is only for the unfrozen control")
+        if args.freeze_layer0_qk and args.freeze_prefix is not None:
+            parser.error("Choose one freeze intervention")
+        if args.freeze_layer0_qk or args.freeze_prefix is not None:
+            if args.resume is None:
+                parser.error("Freeze interventions require --resume")
+            if args.fork_at:
+                parser.error("--fork-at is only for the unfrozen control")
         if any(step > args.steps for step in args.fork_at):
             parser.error("--fork-at steps must be within the training run")
         for name in ("train", "val"):
