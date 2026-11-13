@@ -93,7 +93,8 @@ class Transformer(nn.Module):
                 nn.init.normal_(module.weight, std=0.02)
                 if isinstance(module, nn.Linear) and module.bias is not None:
                     nn.init.zeros_(module.bias)
-        self.output.weight = self.tokens.weight
+        if not config.get("untie_embeddings", False):
+            self.output.weight = self.tokens.weight
         self.classifier_norm = config.get("classifier_norm")
         if config.get("mlp_depth", 1) == 2:
             for block in self.blocks:
@@ -234,6 +235,8 @@ def train(args):
         if "training_state" not in checkpoint:
             raise ValueError("Resume requires a checkpoint created with --fork-at")
         state = checkpoint["training_state"]
+        if state["config"].get("untie_embeddings", False) != args.untie_embeddings:
+            raise ValueError("Resume configuration differs for untie_embeddings")
         if state["config"].get("alignment_weight", 0.0) != args.alignment_weight:
             raise ValueError("Resume configuration differs for alignment_weight")
         if state["config"].get("classifier_norm") != args.classifier_norm:
@@ -255,7 +258,7 @@ def train(args):
         start_lr = checkpoint["metrics"]["lr"]
 
     if args.freeze_prefix is not None:
-        # The token lookup and output classifier share a parameter.
+        # The output head stays trainable when the embeddings are untied.
         model.tokens.requires_grad_(False)
         model.positions.requires_grad_(False)
         for block in model.blocks[:args.freeze_prefix]:
@@ -442,6 +445,8 @@ def main():
     training.add_argument("--val", type=Path, default=data_dir / "fineweb_val.pt")
     training.add_argument("--out", type=Path, required=True)
     training.add_argument("--vocab-size", type=positive)
+    training.add_argument("--untie-embeddings", action="store_true",
+                          help="Use separate input token embeddings and output weights")
     training.add_argument("--classifier-norm", type=float,
                           help="Fixed L2 norm for final token vectors and classifier rows")
     training.add_argument("--alignment-weight", type=float, default=0.0,

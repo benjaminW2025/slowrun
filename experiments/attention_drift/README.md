@@ -146,3 +146,25 @@ steps 6,750 and 7,000. The comparison uses the first saved checkpoint at or
 below that target. Training timings include batch loading and optimizer work,
 and exclude validation, checkpoint writes, and setup. The final loss and
 mean milliseconds per update use the full matched continuation.
+
+## Prefix freeze with untied embeddings
+
+First train a fresh unfrozen model with `--untie-embeddings` so all three
+timed continuations start with the same independent input and output
+weights and their own optimizer state. Both freeze arms leave the output
+head trainable. Older tied checkpoints still work with the original commands.
+
+```sh
+python -u experiment.py train --untie-embeddings --out runs/untied-prefix/base \
+  --batch-size 4 --steps 4000 --fork-at 4000 --device cuda
+resume=runs/untied-prefix/base/step-00004000.pt
+python -u experiment.py train --untie-embeddings --resume "$resume" \
+  --out runs/untied-prefix/control --batch-size 4 --steps 8000 --device cuda
+python -u experiment.py train --untie-embeddings --resume "$resume" \
+  --out runs/untied-prefix/embeddings --freeze-prefix 0 \
+  --batch-size 4 --steps 8000 --device cuda
+python -u experiment.py train --untie-embeddings --resume "$resume" \
+  --out runs/untied-prefix/block0 --freeze-prefix 1 \
+  --batch-size 4 --steps 8000 --device cuda
+python compare_prefix.py --runs runs/untied-prefix --target 5.90
+```
