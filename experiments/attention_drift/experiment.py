@@ -267,9 +267,11 @@ def train(args):
         # AdamW skips frozen parameters because their gradients remain None.
 
     early_steps = {2**power for power in range(8)}
-    qkv = model.blocks[0].attention.qkv.weight
-    qk = qkv[: 2 * args.width]
-    frozen_qk = qk.detach().clone() if args.freeze_layer0_qk else None
+    qk_rows = slice(0, 2 * args.width)
+    frozen_qk = []
+    for layer in args.freeze_qk_layers:
+        qkv = model.blocks[layer].attention.qkv.weight
+        frozen_qk.append((qkv, qkv[qk_rows].detach().clone()))
     args.out.mkdir(parents=True, exist_ok=False)
     (args.out / "config.json").write_text(json.dumps(config, indent=2) + "\n")
 
@@ -320,13 +322,13 @@ def train(args):
             target_cosine = target_logits.mean() / args.classifier_norm**2
             loss = loss + args.alignment_weight * (1 - target_cosine)
         loss.backward()
-        if frozen_qk is not None:
-            qkv.grad[: 2 * args.width].zero_()
+        for qkv, _ in frozen_qk:
+            qkv.grad[qk_rows].zero_()
         optimizer.step()
-        if frozen_qk is not None:
-            # AdamW momentum and weight decay can still move zero-gradient rows.
-            with torch.no_grad():
-                qk.copy_(frozen_qk)
+        # AdamW momentum and weight decay can still move zero-gradient rows.
+        with torch.no_grad():
+            for qkv, original in frozen_qk:
+                qkv[qk_rows].copy_(original)
         if step in early_steps or step in args.fork_at or step % args.save_every == 0 or step == args.steps:
             sync_device()
             training_seconds += time.perf_counter() - interval_start
@@ -455,7 +457,10 @@ def main():
                           help="Number of residual MLPs per attention block")
     training.add_argument("--fork-at", type=positive, nargs="+", default=[])
     training.add_argument("--resume", type=Path)
-    training.add_argument("--freeze-layer0-qk", action="store_true")
+    freeze_qk = training.add_mutually_exclusive_group()
+    freeze_qk.add_argument("--freeze-layer0-qk", action="store_true")
+    freeze_qk.add_argument("--freeze-qk-layers", type=int, nargs="+", default=[],
+                           help="Freeze Q/K weights in the listed zero-based blocks")
     training.add_argument("--freeze-prefix", type=int, choices=(0, 1),
                           help="Freeze embeddings and this many initial blocks (0 or 1)")
     for name, default in {
@@ -487,9 +492,14 @@ def main():
             parser.error("--alignment-weight requires --classifier-norm")
         if args.context < 2 or not math.isfinite(args.lr) or args.lr <= 0:
             parser.error("training requires context >= 2 and a finite positive learning rate")
-        if args.freeze_layer0_qk and args.freeze_prefix is not None:
+        if args.freeze_layer0_qk:
+            args.freeze_qk_layers = [0]
+        args.freeze_qk_layers = sorted(set(args.freeze_qk_layers))
+        if any(layer < 0 or layer >= args.layers for layer in args.freeze_qk_layers):
+            parser.error("--freeze-qk-layers indices must be in [0, --layers)")
+        if args.freeze_qk_layers and args.freeze_prefix is not None:
             parser.error("Choose one freeze intervention")
-        if args.freeze_layer0_qk or args.freeze_prefix is not None:
+        if args.freeze_qk_layers or args.freeze_prefix is not None:
             if args.resume is None:
                 parser.error("Freeze interventions require --resume")
             if args.fork_at:

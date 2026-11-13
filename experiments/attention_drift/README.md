@@ -168,3 +168,21 @@ python -u experiment.py train --untie-embeddings --resume "$resume" \
   --batch-size 4 --steps 8000 --device cuda
 python compare_prefix.py --runs runs/untied-prefix --target 5.90
 ```
+
+### Freeze Q/K in the second block
+
+Use the same untied step-4,000 checkpoint as the untied prefix control.
+Compare block 0 and block 1 separately at matched steps against that control.
+
+```sh
+for block in 0 1; do
+  python -u experiment.py train --untie-embeddings \
+    --resume runs/untied-prefix/base/step-00004000.pt \
+    --out "runs/untied-qk/block${block}" --freeze-qk-layers "$block" \
+    --batch-size 4 --steps 8000 --device cuda || break
+done
+```
+
+If both individual freezes have small penalties, use `--freeze-qk-layers 0 1`
+with a new output directory to test the joint freeze. These runs measure loss.
+The packed QKV projection still computes its full gradient.
