@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import time
+from contextlib import nullcontext
 from pathlib import Path
 
 import numpy as np
@@ -300,6 +301,7 @@ def train(args):
     config["train"] = str(args.train.resolve())
     config["val"] = str(args.val.resolve())
     config["out"] = str(args.out.resolve())
+    config["profile_trace"] = str(args.profile_trace) if args.profile_trace else None
     config["resume"] = str(args.resume.resolve()) if args.resume else None
     if args.width % args.heads:
         raise ValueError("--width must be divisible by --heads")
@@ -386,6 +388,10 @@ def train(args):
         attention.skip_qk_weight_grad = args.skip_frozen_qk_grad
         qkv = attention.qkv.weight
         frozen_qk.append((qkv, qkv[qk_rows].detach().clone()))
+    if args.profile_trace:
+        if args.steps - start_step < 30:
+            raise ValueError("--profile-trace requires at least 30 updates")
+        args.profile_trace.parent.mkdir(parents=True, exist_ok=True)
     args.out.mkdir(parents=True, exist_ok=False)
     (args.out / "config.json").write_text(json.dumps(config, indent=2) + "\n")
 
@@ -421,6 +427,19 @@ def train(args):
         model.train()
 
     save(start_step, start_lr)
+    if args.profile_trace:
+        activities = [torch.profiler.ProfilerActivity.CPU]
+        if device.type == "cuda":
+            activities.append(torch.profiler.ProfilerActivity.CUDA)
+        profiler = torch.profiler.profile(
+            activities=activities,
+            schedule=torch.profiler.schedule(wait=20, warmup=5, active=5),
+            on_trace_ready=lambda trace: trace.export_chrome_trace(str(args.profile_trace)),
+            record_shapes=True,
+        )
+        profiler.start()
+    else:
+        profiler = None
     sync_device()
     interval_start = time.perf_counter()
     for step in range(start_step + 1, args.steps + 1):
@@ -429,21 +448,29 @@ def train(args):
         offsets = sampler.integers(0, len(train_tokens) - args.context, args.batch_size)
         inputs, targets = read_windows(train_tokens, offsets, args.context, device)
         optimizer.zero_grad(set_to_none=True)
-        logits, _ = model(inputs)
-        loss = token_loss(logits, targets)
+        with torch.profiler.record_function("train_forward") if profiler else nullcontext():
+            logits, _ = model(inputs)
+            loss = token_loss(logits, targets)
         if args.alignment_weight:
             target_logits = logits.gather(-1, targets.unsqueeze(-1))
             target_cosine = target_logits.mean() / args.classifier_norm**2
             loss = loss + args.alignment_weight * (1 - target_cosine)
-        loss.backward()
+        with torch.profiler.record_function("train_backward") if profiler else nullcontext():
+            loss.backward()
         if not args.skip_frozen_qk_grad:
             for qkv, _ in frozen_qk:
                 qkv.grad[qk_rows].zero_()
-        optimizer.step()
+        with torch.profiler.record_function("adamw_step") if profiler else nullcontext():
+            optimizer.step()
         # AdamW momentum and weight decay can still move zero-gradient rows.
         with torch.no_grad():
             for qkv, original in frozen_qk:
                 qkv[qk_rows].copy_(original)
+        if profiler is not None:
+            profiler.step()
+            if step - start_step == 30:
+                profiler.stop()
+                profiler = None
         if step in early_steps or step in args.fork_at or step % args.save_every == 0 or step == args.steps:
             sync_device()
             training_seconds += time.perf_counter() - interval_start
@@ -572,6 +599,8 @@ def main():
                           help="Number of residual MLPs per attention block")
     training.add_argument("--fork-at", type=positive, nargs="+", default=[])
     training.add_argument("--resume", type=Path)
+    training.add_argument("--profile-trace", type=Path,
+                          help="Export a profiler trace for updates 26–30 of a continuation")
     freeze_qk = training.add_mutually_exclusive_group()
     freeze_qk.add_argument("--freeze-layer0-qk", action="store_true")
     freeze_qk.add_argument("--freeze-qk-layers", type=int, nargs="+", default=[],
