@@ -207,3 +207,21 @@ python -u experiment.py train --untie-embeddings \
 Subtract each arm's cumulative `training_seconds` at step 4,250 from its
 value at 4,500 to exclude the first 250 steps from the timing. Repeat in
 reverse order with new output directories if the timing difference is small.
+
+### Freeze the attention output projection
+
+Fork from the same untied step-4,000 checkpoint and freeze only the
+first block's attention output projection (W_O). Q/K/V and the
+rest of the model continue training. Backward still computes the input
+gradient through W_O, but skips its weight gradient and optimizer update.
+
+```sh
+python -u experiment.py train --untie-embeddings \
+  --resume runs/untied-prefix/base/step-00004000.pt \
+  --out runs/untied-o/block0 --freeze-o-layers 0 \
+  --batch-size 4 --steps 8000 --device cuda
+```
+
+Compare validation loss with the existing untied control at the same step.
+For a timing comparison, use the same idle GPU and measure the same
+steady-state intervals in a fresh control and frozen run.

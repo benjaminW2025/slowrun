@@ -283,6 +283,8 @@ def train(args):
         start_step = checkpoint["metrics"]["step"]
         start_lr = checkpoint["metrics"]["lr"]
 
+    for layer in args.freeze_o_layers:
+        model.blocks[layer].attention.output.requires_grad_(False)
     if args.freeze_prefix is not None:
         # The output head stays trainable when the embeddings are untied.
         model.tokens.requires_grad_(False)
@@ -492,6 +494,8 @@ def main():
                            help="Freeze Q/K weights in the listed zero-based blocks")
     training.add_argument("--skip-frozen-qk-grad", action="store_true",
                           help="Compute only the V weight gradient in Q/K-frozen blocks")
+    training.add_argument("--freeze-o-layers", type=int, nargs="+", default=[],
+                          help="Freeze attention output projections in the listed zero-based blocks")
     training.add_argument("--freeze-prefix", type=int, choices=(0, 1),
                           help="Freeze embeddings and this many initial blocks (0 or 1)")
     for name, default in {
@@ -530,9 +534,12 @@ def main():
             parser.error("--freeze-qk-layers indices must be in [0, --layers)")
         if args.skip_frozen_qk_grad and not args.freeze_qk_layers:
             parser.error("--skip-frozen-qk-grad requires a Q/K freeze")
-        if args.freeze_qk_layers and args.freeze_prefix is not None:
-            parser.error("Choose one freeze intervention")
-        if args.freeze_qk_layers or args.freeze_prefix is not None:
+        args.freeze_o_layers = sorted(set(args.freeze_o_layers))
+        if any(layer < 0 or layer >= args.layers for layer in args.freeze_o_layers):
+            parser.error("--freeze-o-layers indices must be in [0, --layers)")
+        if args.freeze_prefix is not None and (args.freeze_qk_layers or args.freeze_o_layers):
+            parser.error("--freeze-prefix cannot be combined with projection freezes")
+        if args.freeze_qk_layers or args.freeze_o_layers or args.freeze_prefix is not None:
             if args.resume is None:
                 parser.error("Freeze interventions require --resume")
             if args.fork_at:
