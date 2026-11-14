@@ -1,4 +1,4 @@
-"""Matched off/MLP comparison. Run from anywhere; see baseline_comparison.md."""
+"""Matched meta-gradient or block 0 attention freeze comparison. Run from anywhere; see baseline_comparison.md."""
 import argparse
 import hashlib
 import json
@@ -15,6 +15,8 @@ def main():
     parser.add_argument("--profile", choices=("medium", "small", "original"), default="medium")
     parser.add_argument("--precision", choices=("fp16", "bf16", "fp32"), default=None,
                         help="Defaults to BF16 for medium (L40), FP16 for older GPU profiles")
+    parser.add_argument("--freeze-block0-o", action="store_true",
+                        help="Compare unfrozen and halfway freeze arms with meta-gradient off.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--gpu", default="0")
     parser.add_argument("--execute", action="store_true", help="Launch training; otherwise print commands only")
@@ -24,6 +26,8 @@ def main():
     small = args.profile == "small"
     medium = args.profile == "medium"
     one_pass = args.stage == "one-pass"
+    if args.freeze_block0_o and not (medium and one_pass):
+        parser.error("--freeze-block0-o requires --profile medium --stage one-pass")
     if one_pass and not medium:
         parser.error("one-pass currently requires --profile medium")
     # Match loader chunking: 100M source tokens, 2049-token chunks, batch four.
@@ -35,6 +39,8 @@ def main():
     if one_pass:
         eval_tokens = 1048576
     name = f"baseline-{args.profile}-{args.stage}-s{args.seed}-{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}"
+    if args.freeze_block0_o:
+        name = f"wo-{name}"
     precision = args.precision or ("bf16" if medium else "fp16")
     common = ["--precision", precision, "--loss-scale", "128", "--no-compile",
               "--device-batch-size", "4" if small or medium else "1", "--virtual-ranks", "1" if small or medium else "8",
@@ -53,10 +59,17 @@ def main():
         # Exercise the previously problematic recurrent backward immediately.
         common += ["--iteration-schedule", "constant", "--num-iterations", "2"]
     print(f"Profile={args.profile}; {steps} steps/arm; benchmark measures runtime; one-pass covers approximately 100M target tokens.", flush=True)
-    arms = ("off", "mlp")
+    arm_flags = {
+        "control": ["--mg-mode", "off"],
+        "freeze": ["--mg-mode", "off", "--freeze-block0-o-after", str(steps // 2)],
+    } if args.freeze_block0_o else {
+        "off": ["--mg-mode", "off"],
+        "mlp": ["--mg-mode", "mlp"],
+    }
+    arms = tuple(arm_flags)
     # Each arm runs in its own process with the same initialization and loader seed.
     commands = [[sys.executable, str(here / "train.py"), *common,
-                 "--mg-mode", arm, "--run-name", f"{name}-{arm}"] for arm in arms]
+                 *arm_flags[arm], "--run-name", f"{name}-{arm}"] for arm in arms]
     import shlex
     for command in commands:
         print(shlex.join(command), flush=True)
@@ -122,8 +135,10 @@ def main():
         r = row["result"]
         print(f"{arm:6}  {r['raw_final_val_loss']:.6f}          {r['val_loss']:.6f}         "
               f"{r['model_variant']:22} {row['process_wall_seconds'] / 60:.2f}")
-    delta = results['mlp']['result']['raw_final_val_loss'] - results['off']['result']['raw_final_val_loss']
-    print(f"MLP minus off, raw final loss: {delta:+.6f} (negative favors meta-gradient)")
+    control, treatment = arms
+    delta = (results[treatment]["result"]["raw_final_val_loss"]
+             - results[control]["result"]["raw_final_val_loss"])
+    print(f"{treatment} minus {control}, raw final loss: {delta:+.6f}")
     print(f"Artifacts: {output}")
     if args.stage == "benchmark":
         for arm in arms:

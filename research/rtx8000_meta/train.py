@@ -156,6 +156,8 @@ parser.add_argument("--no-doc-shuffle", action="store_true",
                     help="Disable per-epoch document reshuffling (still shuffles batch order)")
 parser.add_argument("--max-train-steps", type=int, default=3040,
                     help="Stop after this many optimizer steps. Use 0 to train for all epochs.")
+parser.add_argument("--freeze-block0-o-after", type=int, default=None,
+                    help="Freeze block 0 attention output after this many completed updates.")
 parser.add_argument("--schedule-steps", type=int, default=0,
                     help="For short pilots, compress LR, weight-decay, recurrence and SWA schedules to this many steps; 0 retains baseline scheduling.")
 parser.add_argument("--eval-tokens", type=int, default=10_000_000,
@@ -195,6 +197,11 @@ if args.loss_scale <= 0:
     raise ValueError("--loss-scale must be positive")
 if args.virtual_ranks < 1:
     raise ValueError("--virtual-ranks must be >= 1")
+if args.freeze_block0_o_after is not None:
+    if not 0 <= args.freeze_block0_o_after < args.max_train_steps:
+        parser.error("--freeze-block0-o-after requires a later --max-train-steps")
+    if args.probe_every > 0:
+        parser.error("--freeze-block0-o-after is for training without probes")
 if args.schedule_steps < 0 or args.eval_tokens <= 0:
     raise ValueError("--schedule-steps must be nonnegative and --eval-tokens must be positive")
 
@@ -1499,7 +1506,19 @@ if eval_num_iterations == NUM_ITERATIONS:
     min_val_loss = val_loss
 model.train()
 
+block0_o = orig_model.transformer.h[0].attn.c_proj.weight
 while current_epoch <= args.num_epochs:
+    if step == args.freeze_block0_o_after:
+        block0_o.requires_grad_(False)
+        trainable_params = [p for p in trainable_params if p is not block0_o]
+        optimizer_parameter_ids.remove(id(block0_o))
+        trial_params = [p for p in trial_params if p is not block0_o]
+        if trial_groups is not None:
+            trial_groups = [([p for p in params if p is not block0_o], norm)
+                            for params, norm in trial_groups]
+        # Muon masks parameters with grad=None, including momentum and decay.
+        print0(f"Froze block 0 attention output after update {step}", flush=True)
+
     next_num_iterations = get_scheduled_iterations(
         ITERATION_SCHEDULE, step, num_train_steps
     )
